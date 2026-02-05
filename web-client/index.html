@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Teleop Latency Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Space+Grotesk:wght@400;600&display=swap');
+        
+        :root {
+            --bg: #0a0a0f;
+            --bg2: #12121a;
+            --bg3: #1a1a25;
+            --cyan: #00f5d4;
+            --magenta: #f72585;
+            --yellow: #fee440;
+            --blue: #4361ee;
+            --orange: #ff6b35;
+            --purple: #9b5de5;
+            --text: #e8e8e8;
+            --text2: #8a8a9a;
+            --border: #2a2a3a;
+        }
+        
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            font-family: 'Space Grotesk', sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+        }
+        
+        .grid-bg {
+            position: fixed;
+            inset: 0;
+            background-image: 
+                linear-gradient(rgba(0,245,212,0.02) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(0,245,212,0.02) 1px, transparent 1px);
+            background-size: 40px 40px;
+            pointer-events: none;
+        }
+        
+        .container { position: relative; max-width: 1400px; margin: 0 auto; padding: 20px; }
+        
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid var(--border);
+        }
+        
+        .logo { display: flex; align-items: center; gap: 12px; }
+        .logo-icon {
+            width: 36px; height: 36px;
+            background: linear-gradient(135deg, var(--cyan), var(--blue));
+            border-radius: 8px;
+            display: flex; align-items: center; justify-content: center;
+        }
+        .logo h1 {
+            font-size: 18px;
+            background: linear-gradient(135deg, var(--cyan), var(--magenta));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        
+        .status {
+            display: flex; align-items: center; gap: 8px;
+            padding: 6px 14px;
+            background: var(--bg2);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+        }
+        .status-dot {
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            background: #ff006e;
+        }
+        .status-dot.on { background: #00f5a0; }
+        
+        .main { display: grid; grid-template-columns: 1fr 300px; gap: 16px; }
+        
+        .panel {
+            background: var(--bg2);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+        }
+        .panel-header {
+            padding: 12px 16px;
+            background: var(--bg3);
+            border-bottom: 1px solid var(--border);
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text2);
+        }
+        .panel-body { padding: 16px; }
+        
+        .chart-wrap { height: 260px; }
+        
+        .metrics {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 8px;
+            margin-top: 16px;
+        }
+        .metric {
+            background: var(--bg3);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 12px;
+            border-left: 3px solid var(--cyan);
+        }
+        .metric.m { border-left-color: var(--magenta); }
+        .metric.y { border-left-color: var(--yellow); }
+        .metric.b { border-left-color: var(--blue); }
+        .metric.o { border-left-color: var(--orange); }
+        .metric.p { border-left-color: var(--purple); }
+        
+        .metric-label { font-size: 10px; color: var(--text2); margin-bottom: 4px; }
+        .metric-val { font-family: 'JetBrains Mono', monospace; font-size: 18px; font-weight: 600; }
+        .metric-unit { font-size: 11px; color: var(--text2); }
+        
+        /* Speed Control */
+        .speed-control {
+            margin-bottom: 16px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid var(--border);
+        }
+        
+        .speed-label {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+            font-size: 12px;
+        }
+        
+        .speed-value {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 18px;
+            font-weight: 600;
+            color: var(--cyan);
+        }
+        
+        .speed-slider {
+            width: 100%;
+            height: 8px;
+            -webkit-appearance: none;
+            appearance: none;
+            background: var(--bg);
+            border-radius: 4px;
+            outline: none;
+        }
+        
+        .speed-slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 20px;
+            height: 20px;
+            background: linear-gradient(135deg, var(--cyan), var(--blue));
+            border-radius: 50%;
+            cursor: pointer;
+            box-shadow: 0 2px 8px rgba(0, 245, 212, 0.3);
+        }
+        
+        .speed-slider::-moz-range-thumb {
+            width: 20px;
+            height: 20px;
+            background: linear-gradient(135deg, var(--cyan), var(--blue));
+            border-radius: 50%;
+            cursor: pointer;
+            border: none;
+        }
+        
+        .speed-range {
+            display: flex;
+            justify-content: space-between;
+            font-size: 10px;
+            color: var(--text2);
+            margin-top: 4px;
+        }
+        
+        /* Keyboard Controls */
+        .keyboard-control {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .key-row {
+            display: flex;
+            gap: 8px;
+        }
+        
+        .key {
+            width: 44px;
+            height: 44px;
+            background: var(--bg);
+            border: 2px solid var(--border);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text2);
+            transition: all 0.1s;
+        }
+        
+        .key.active {
+            background: var(--cyan);
+            border-color: var(--cyan);
+            color: var(--bg);
+            box-shadow: 0 0 15px rgba(0, 245, 212, 0.4);
+        }
+        
+        .key-hint {
+            font-size: 10px;
+            color: var(--text2);
+            text-align: center;
+            margin-top: 8px;
+        }
+        
+        /* Joystick (backup) */
+        .joystick-container {
+            width: 120px; height: 120px;
+            margin: 12px auto 0;
+            background: var(--bg);
+            border: 2px solid var(--border);
+            border-radius: 50%;
+            position: relative;
+            touch-action: none;
+        }
+        .joystick-knob {
+            width: 36px; height: 36px;
+            background: linear-gradient(135deg, var(--cyan), var(--blue));
+            border-radius: 50%;
+            position: absolute;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            cursor: grab;
+        }
+        .crosshair {
+            position: absolute; inset: 0;
+            pointer-events: none;
+        }
+        .crosshair::before, .crosshair::after {
+            content: ''; position: absolute; background: var(--border);
+        }
+        .crosshair::before { width: 1px; height: 100%; left: 50%; }
+        .crosshair::after { height: 1px; width: 100%; top: 50%; }
+        
+        .values {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            margin-top: 12px;
+        }
+        .value-box {
+            background: var(--bg);
+            padding: 8px;
+            border-radius: 6px;
+            text-align: center;
+        }
+        .value-label { font-size: 10px; color: var(--text2); }
+        .value-num { font-family: 'JetBrains Mono', monospace; font-size: 14px; color: var(--cyan); }
+        
+        .btn {
+            width: 100%;
+            padding: 10px;
+            margin-top: 8px;
+            border: none;
+            border-radius: 6px;
+            font-family: inherit;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, var(--cyan), var(--blue));
+            color: var(--bg);
+        }
+        .btn-secondary {
+            background: var(--bg);
+            color: var(--text);
+            border: 1px solid var(--border);
+        }
+        
+        .breakdown { margin-top: 12px; }
+        .breakdown-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid var(--border);
+            font-size: 11px;
+        }
+        .breakdown-item:last-child { border: none; }
+        .breakdown-label { display: flex; align-items: center; gap: 6px; }
+        .breakdown-dot { width: 8px; height: 8px; border-radius: 2px; }
+        .breakdown-val { font-family: 'JetBrains Mono', monospace; font-weight: 600; }
+        
+        /* Timestamps */
+        .timestamps {
+            background: var(--bg);
+            padding: 10px;
+            border-radius: 6px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 10px;
+        }
+        .ts-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 4px 0;
+            border-bottom: 1px solid var(--border);
+        }
+        .ts-row:last-child { border: none; }
+        .ts-label { color: var(--text2); }
+        .ts-val { color: var(--cyan); }
+        
+        .sync-info {
+            background: var(--bg);
+            padding: 10px;
+            border-radius: 6px;
+            margin-top: 10px;
+            font-size: 10px;
+        }
+        .sync-row { display: flex; justify-content: space-between; margin-bottom: 4px; }
+        .sync-row:last-child { margin: 0; }
+        .sync-label { color: var(--text2); }
+        .sync-val { font-family: 'JetBrains Mono', monospace; color: var(--cyan); }
+        
+        .sync-note {
+            margin-top: 10px;
+            padding: 8px;
+            background: rgba(0, 245, 212, 0.1);
+            border-radius: 4px;
+            font-size: 9px;
+            color: var(--cyan);
+            text-align: center;
+        }
+        
+        .proto-info {
+            margin-top: 12px;
+            padding: 10px;
+            background: var(--bg);
+            border-radius: 6px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 9px;
+            color: var(--text2);
+        }
+        .proto-info code { color: var(--cyan); }
+        
+        /* Field Selector */
+        .field-info {
+            background: var(--bg);
+            padding: 10px;
+            border-radius: 6px;
+            margin-bottom: 10px;
+        }
+        .field-info-row {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 4px;
+            font-size: 11px;
+        }
+        .field-info-row:last-child { margin: 0; }
+        .field-info-label { color: var(--text2); }
+        .field-info-val {
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 600;
+            color: var(--cyan);
+        }
+        
+        .field-selector {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin-bottom: 10px;
+        }
+        
+        .field-toggle {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 10px;
+            background: var(--bg);
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 11px;
+            transition: all 0.15s;
+        }
+        .field-toggle:hover { background: var(--bg3); }
+        
+        .field-toggle input[type="checkbox"] {
+            appearance: none;
+            -webkit-appearance: none;
+            width: 16px;
+            height: 16px;
+            border: 2px solid var(--border);
+            border-radius: 3px;
+            cursor: pointer;
+            position: relative;
+            flex-shrink: 0;
+        }
+        .field-toggle input[type="checkbox"]:checked {
+            background: var(--cyan);
+            border-color: var(--cyan);
+        }
+        .field-toggle input[type="checkbox"]:checked::after {
+            content: '✓';
+            position: absolute;
+            top: -2px;
+            left: 1px;
+            font-size: 12px;
+            color: var(--bg);
+            font-weight: bold;
+        }
+        
+        .field-name { flex: 1; color: var(--text); }
+        .field-bit {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 9px;
+            color: var(--text2);
+        }
+
+        @media (max-width: 900px) {
+            .main { grid-template-columns: 1fr; }
+            .metrics { grid-template-columns: repeat(2, 1fr); }
+        }
+    </style>
+</head>
+<body>
+    <div class="grid-bg"></div>
+    <div class="container">
+        <header>
+            <div class="logo">
+                <div class="logo-icon">⚡</div>
+                <h1>Teleop Latency</h1>
+            </div>
+            <div class="status">
+                <div class="status-dot" id="statusDot"></div>
+                <span id="statusText">Disconnected</span>
+            </div>
+        </header>
+        
+        <div class="main">
+            <div class="left">
+                <div class="panel">
+                    <div class="panel-header">RTT Latency (20s)</div>
+                    <div class="panel-body">
+                        <div class="chart-wrap"><canvas id="chart"></canvas></div>
+                        <div class="metrics">
+                            <div class="metric"><div class="metric-label">Total RTT</div><div class="metric-val" id="mRtt">--<span class="metric-unit">ms</span></div></div>
+                            <div class="metric m"><div class="metric-label">Browser→Relay</div><div class="metric-val" id="mBR">--<span class="metric-unit">ms</span></div></div>
+                            <div class="metric y"><div class="metric-label">Relay→Python</div><div class="metric-val" id="mRP">--<span class="metric-unit">ms</span></div></div>
+                            <div class="metric b"><div class="metric-label">Python Proc</div><div class="metric-val" id="mPy">--<span class="metric-unit">ms</span></div></div>
+                            <div class="metric o"><div class="metric-label">Python→Relay</div><div class="metric-val" id="mPR">--<span class="metric-unit">ms</span></div></div>
+                            <div class="metric p"><div class="metric-label">Relay→Browser</div><div class="metric-val" id="mRB">--<span class="metric-unit">ms</span></div></div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="panel" style="margin-top:16px">
+                    <div class="panel-header">Latency Breakdown (μs precision)</div>
+                    <div class="panel-body">
+                        <div class="breakdown" id="breakdown"></div>
+                    </div>
+                </div>
+                
+                <div class="panel" style="margin-top:16px">
+                    <div class="panel-header">Timestamps</div>
+                    <div class="panel-body">
+                        <div class="timestamps" id="timestamps">
+                            <div class="ts-row"><span class="ts-label">Waiting for data...</span></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="right">
+                <div class="panel">
+                    <div class="panel-header">Keyboard Control</div>
+                    <div class="panel-body">
+                        <!-- Speed Control -->
+                        <div class="speed-control">
+                            <div class="speed-label">
+                                <span>Speed</span>
+                                <span class="speed-value" id="speedValue">1.0</span>
+                            </div>
+                            <input type="range" id="speedSlider" class="speed-slider" min="1" max="8" step="0.5" value="1">
+                            <div class="speed-range">
+                                <span>1.0</span>
+                                <span>8.0</span>
+                            </div>
+                        </div>
+                        
+                        <div class="keyboard-control">
+                            <div class="key-row">
+                                <div class="key" id="key-w">W</div>
+                            </div>
+                            <div class="key-row">
+                                <div class="key" id="key-a">A</div>
+                                <div class="key" id="key-s">S</div>
+                                <div class="key" id="key-d">D</div>
+                            </div>
+                            <div class="key-hint">
+                                WASD or Arrow Keys to move<br>
+                                Space to stop
+                            </div>
+                        </div>
+                        
+                        <div class="joystick-container" id="joystick">
+                            <div class="crosshair"></div>
+                            <div class="joystick-knob" id="knob"></div>
+                        </div>
+                        
+                        <div class="values">
+                            <div class="value-box"><div class="value-label">Linear Y</div><div class="value-num" id="linY">0.00</div></div>
+                            <div class="value-box"><div class="value-label">Angular Z</div><div class="value-num" id="angZ">0.00</div></div>
+                        </div>
+                        <button class="btn btn-primary" id="connectBtn">Connect</button>
+                        <button class="btn btn-secondary" id="stopBtn">Stop (Space)</button>
+                    </div>
+                </div>
+                
+                <div class="panel" style="margin-top:16px">
+                    <div class="panel-header">Clock Sync (Browser ↔ Relay)</div>
+                    <div class="panel-body">
+                        <div class="sync-info">
+                            <div class="sync-row"><span class="sync-label">Offset</span><span class="sync-val" id="syncOffset">--</span></div>
+                            <div class="sync-row"><span class="sync-label">RTT</span><span class="sync-val" id="syncRtt">--</span></div>
+                            <div class="sync-row"><span class="sync-label">Status</span><span class="sync-val" id="syncStatus">--</span></div>
+                        </div>
+                        <button class="btn btn-secondary" id="syncBtn">Force Sync</button>
+                        <div class="sync-note">All timestamps in Relay Time</div>
+                    </div>
+                </div>
+                
+                <div class="panel" style="margin-top:16px">
+                    <div class="panel-header">Field Selector</div>
+                    <div class="panel-body">
+                        <div class="field-info">
+                            <div class="field-info-row">
+                                <span class="field-info-label">Mask</span>
+                                <span class="field-info-val" id="fieldMask">0x22</span>
+                            </div>
+                            <div class="field-info-row">
+                                <span class="field-info-label">Fields</span>
+                                <span class="field-info-val" id="fieldCount">2/6</span>
+                            </div>
+                            <div class="field-info-row">
+                                <span class="field-info-label">Msg Size</span>
+                                <span class="field-info-val" id="msgSize">34B</span>
+                            </div>
+                        </div>
+                        <div class="field-selector" id="fieldSelector"></div>
+                        
+                        <div class="proto-info">
+                            <div>Binary Protocol:</div>
+                            <div><code>0x01</code> Twist (18 + 8×N B)</div>
+                            <div><code>0x02</code> Ack (69B → 77B)</div>
+                            <div><code>0x03</code> SyncReq (9B)</div>
+                            <div><code>0x04</code> SyncResp (25B)</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
