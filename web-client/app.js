@@ -68,7 +68,7 @@ function popcount(mask) {
 
 // ============ CONFIG ============
 const CONFIG = {
-    wsUrl: `ws://${location.hostname || 'localhost'}:8081/ws/data?type=web`,
+    wsUrl: `ws://${location.hostname || 'localhost'}:8080/ws/data?type=web`,
     sendHz: 20,
     chartWindowSec: 20,
     syncIntervalMs: 10000,
