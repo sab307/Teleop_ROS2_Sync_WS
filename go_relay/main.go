@@ -1,7 +1,52 @@
 package main
 
+/*
+WebRTC Signaling Server
+=======================
+
+ROLE: This server handles ONLY the WebRTC handshake (SDP + ICE exchange).
+Once the RTCPeerConnection is established and the DataChannel opens,
+all binary robot-control data (Twist, Ack, ClockSync) flows directly
+between the browser and the Python process — the Go server is no longer
+in the data path.
+
+SIGNALING FLOW:
+  1. Python  connects → /ws/signal?role=python
+  2. Browser connects → /ws/signal?role=browser
+  3. Go sends "peer_ready" to each side when both are present
+  4. Browser creates RTCPeerConnection + DataChannel, generates SDP offer
+  5. Browser sends {"type":"offer","sdp":"..."} through Go to Python
+  6. Python (aiortc) sets remote desc, creates SDP answer
+  7. Python sends {"type":"answer","sdp":"...","to_peer":"<browser_id>"} to Go
+  8. Go routes answer to the correct browser
+  9. Both sides exchange ICE candidates through Go
+ 10. DataChannel opens → P2P established, Go steps aside
+
+MESSAGE ENVELOPE (all JSON):
+  From Browser:
+    {"type":"offer",         "sdp":"..."}
+    {"type":"ice_candidate", "candidate":"...", "sdpMid":"...", "sdpMLineIndex":0}
+
+  From Python:
+    {"type":"answer",        "sdp":"...", "to_peer":"<browser_id>"}
+    {"type":"ice_candidate", "candidate":"...", "sdpMid":"...", "sdpMLineIndex":0, "to_peer":"<browser_id>"}
+
+  To Browser:
+    {"type":"welcome",          "peer_id":"<id>"}
+    {"type":"peer_ready",       "role":"python"}
+    {"type":"answer",           "sdp":"..."}
+    {"type":"ice_candidate",    "candidate":"...", "sdpMid":"...", "sdpMLineIndex":0}
+    {"type":"peer_disconnected","role":"python"}
+
+  To Python:
+    {"type":"welcome",          "peer_id":"<id>"}
+    {"type":"peer_ready",       "role":"browser", "from_peer":"<browser_id>"}
+    {"type":"offer",            "sdp":"...", "from_peer":"<browser_id>"}
+    {"type":"ice_candidate",    "candidate":"...", "sdpMid":"...", "sdpMLineIndex":0, "from_peer":"<browser_id>"}
+    {"type":"peer_disconnected","role":"browser",  "from_peer":"<browser_id>"}
+*/
+
 import (
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -13,197 +58,74 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-/*
-BINARY PROTOCOL
-===============
+// ─── Signal message ───────────────────────────────────────────────────────────
 
-All messages use little-endian byte order.
-First byte is message type:
-  0x01 = Twist Command
-  0x02 = Twist Ack
-  0x03 = Clock Sync Request
-  0x04 = Clock Sync Response
-
-TWIST MESSAGE (variable size):
-  [0]     uint8   type (0x01)
-  [1-8]   uint64  message_id
-  [9-16]  uint64  t1_browser_send
-  [17]    uint8   field_mask (bitmask of included velocity fields)
-  [18+]   float64 × popcount(field_mask) velocity values
-
-  Field mask bits:
-    bit 0 (0x01) = linear.x
-    bit 1 (0x02) = linear.y
-    bit 2 (0x04) = linear.z
-    bit 3 (0x08) = angular.x
-    bit 4 (0x10) = angular.y
-    bit 5 (0x20) = angular.z
-
-  Examples:
-    linear.y + angular.z (0x22) = 18 + 16 = 34 bytes
-    All 6 fields (0x3F)         = 18 + 48 = 66 bytes
-
-  Relay appends t2 + t3 (16 bytes) at the end.
-
-ENCODING IN GO
---------------
-    binary.LittleEndian.PutUint64(buf[offset:], value)
-    value := binary.LittleEndian.Uint64(buf[offset:])
-*/
-
-// Message type constants
-const (
-	MsgTypeTwist            = 0x01
-	MsgTypeTwistAck         = 0x02
-	MsgTypeClockSyncRequest = 0x03
-	MsgTypeClockSyncResp    = 0x04
-
-	TwistHeaderSize   = 18 // type + msg_id + t1 + field_mask
-	TwistRelayAppend  = 16 // t2 + t3
-	AckFromPythonSize = 69
-	AckToBrowserSize  = 77
-	ClockSyncReqSize  = 9
-	ClockSyncRespSize = 25
-)
-
-// currentTimeMs returns milliseconds since Unix epoch
-func currentTimeMs() uint64 {
-	return uint64(time.Now().UnixMilli())
+// SignalMsg is the JSON envelope for all signaling messages.
+type SignalMsg struct {
+	Type          string `json:"type"`
+	SDP           string `json:"sdp,omitempty"`
+	Candidate     string `json:"candidate,omitempty"`
+	SdpMid        string `json:"sdpMid,omitempty"`
+	SdpMLineIndex *int   `json:"sdpMLineIndex,omitempty"`
+	Role          string `json:"role,omitempty"`
+	PeerID        string `json:"peer_id,omitempty"`   // used in "welcome"
+	FromPeer      string `json:"from_peer,omitempty"` // routing: sender id
+	ToPeer        string `json:"to_peer,omitempty"`   // routing: recipient id
 }
 
-// Peer represents a WebSocket connection
+// ─── Peer ─────────────────────────────────────────────────────────────────────
+
 type Peer struct {
-	ID       string
-	Type     string // "web" or "python"
-	Conn     *websocket.Conn
-	SendChan chan []byte
-	mu       sync.Mutex
+	id   string
+	role string // "browser" | "python"
+	conn *websocket.Conn
+	send chan []byte
+	mu   sync.Mutex
+	hub  *Hub
 }
 
-// PeerManager manages connected peers
-type PeerManager struct {
-	mu         sync.RWMutex
-	peers      map[string]*Peer
-	webPeers   map[string]*Peer
-	pythonPeer *Peer
+func newPeerID(role string) string {
+	return fmt.Sprintf("%s_%d", role, time.Now().UnixNano())
 }
 
-var manager = &PeerManager{
-	peers:    make(map[string]*Peer),
-	webPeers: make(map[string]*Peer),
-}
-
-var upgrader = websocket.Upgrader{
-	CheckOrigin:     func(r *http.Request) bool { return true },
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-}
-
-func newPeerID() string {
-	return fmt.Sprintf("peer_%d", time.Now().UnixNano())
-}
-
-func (m *PeerManager) addPeer(p *Peer) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.peers[p.ID] = p
-	if p.Type == "web" {
-		m.webPeers[p.ID] = p
-	} else if p.Type == "python" {
-		m.pythonPeer = p
-	}
-	log.Printf("+ Peer %s (%s), total: %d", p.ID, p.Type, len(m.peers))
-}
-
-func (m *PeerManager) removePeer(p *Peer) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.peers, p.ID)
-	delete(m.webPeers, p.ID)
-	if m.pythonPeer != nil && m.pythonPeer.ID == p.ID {
-		m.pythonPeer = nil
-	}
-	log.Printf("- Peer %s, total: %d", p.ID, len(m.peers))
-}
-
-func (m *PeerManager) getPython() *Peer {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.pythonPeer
-}
-
-func (m *PeerManager) getWebPeers() []*Peer {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	peers := make([]*Peer, 0, len(m.webPeers))
-	for _, p := range m.webPeers {
-		peers = append(peers, p)
-	}
-	return peers
-}
-
-// WebSocket handler
-func handleWS(w http.ResponseWriter, r *http.Request) {
-	peerType := r.URL.Query().Get("type")
-	if peerType == "" {
-		peerType = "web"
-	}
-
-	conn, err := upgrader.Upgrade(w, r, nil)
+func (p *Peer) sendMsg(msg SignalMsg) {
+	data, err := json.Marshal(msg)
 	if err != nil {
-		log.Printf("Upgrade error: %v", err)
+		log.Printf("[signal] marshal error: %v", err)
 		return
 	}
-
-	peer := &Peer{
-		ID:       newPeerID(),
-		Type:     peerType,
-		Conn:     conn,
-		SendChan: make(chan []byte, 256),
+	select {
+	case p.send <- data:
+	default:
+		log.Printf("[signal] %s send buffer full — dropping", p.id)
 	}
-	manager.addPeer(peer)
-
-	defer func() {
-		manager.removePeer(peer)
-		conn.Close()
-	}()
-
-	// Send welcome (JSON)
-	welcome := map[string]interface{}{
-		"type":    "welcome",
-		"peer_id": peer.ID,
-	}
-	conn.WriteJSON(welcome)
-
-	// Start writer goroutine
-	go writeLoop(peer)
-
-	// Read loop
-	readLoop(peer)
 }
 
-func writeLoop(peer *Peer) {
-	ticker := time.NewTicker(30 * time.Second)
+// writeLoop drains send channel; sends WebSocket pings to keep alive.
+func (p *Peer) writeLoop() {
+	ticker := time.NewTicker(25 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case msg, ok := <-peer.SendChan:
+		case msg, ok := <-p.send:
 			if !ok {
-				peer.Conn.WriteMessage(websocket.CloseMessage, nil)
+				p.mu.Lock()
+				_ = p.conn.WriteMessage(websocket.CloseMessage, nil)
+				p.mu.Unlock()
 				return
 			}
-			peer.mu.Lock()
-			err := peer.Conn.WriteMessage(websocket.BinaryMessage, msg)
-			peer.mu.Unlock()
+			p.mu.Lock()
+			err := p.conn.WriteMessage(websocket.TextMessage, msg)
+			p.mu.Unlock()
 			if err != nil {
 				return
 			}
 
 		case <-ticker.C:
-			peer.mu.Lock()
-			err := peer.Conn.WriteMessage(websocket.PingMessage, nil)
-			peer.mu.Unlock()
+			p.mu.Lock()
+			err := p.conn.WriteMessage(websocket.PingMessage, nil)
+			p.mu.Unlock()
 			if err != nil {
 				return
 			}
@@ -211,246 +133,229 @@ func writeLoop(peer *Peer) {
 	}
 }
 
-func readLoop(peer *Peer) {
-	peer.Conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-	peer.Conn.SetPongHandler(func(string) error {
-		peer.Conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+// readLoop reads JSON signaling messages and dispatches them.
+func (p *Peer) readLoop() {
+	p.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	p.conn.SetPongHandler(func(string) error {
+		p.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		return nil
 	})
 
 	for {
-		msgType, data, err := peer.Conn.ReadMessage()
+		_, data, err := p.conn.ReadMessage()
 		if err != nil {
 			return
 		}
-		peer.Conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		p.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 
-		if msgType == websocket.BinaryMessage {
-			handleBinary(peer, data)
+		var msg SignalMsg
+		if err := json.Unmarshal(data, &msg); err != nil {
+			log.Printf("[signal] %s bad JSON: %v", p.id, err)
+			continue
+		}
+
+		p.hub.dispatch(p, msg)
+	}
+}
+
+// ─── Hub ──────────────────────────────────────────────────────────────────────
+
+// Hub tracks peers and routes signaling messages.
+type Hub struct {
+	mu       sync.RWMutex
+	python   *Peer
+	browsers map[string]*Peer
+}
+
+var hub = &Hub{
+	browsers: make(map[string]*Peer),
+}
+
+func (h *Hub) add(p *Peer) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if p.role == "python" {
+		if h.python != nil {
+			log.Printf("[signal] Python reconnect — closing old %s", h.python.id)
+			close(h.python.send)
+		}
+		h.python = p
+		log.Printf("[signal] + python  %s  (browsers: %d)", p.id, len(h.browsers))
+		// Notify existing browsers
+		for _, b := range h.browsers {
+			b.sendMsg(SignalMsg{Type: "peer_ready", Role: "python"})
+		}
+	} else {
+		h.browsers[p.id] = p
+		log.Printf("[signal] + browser %s  (total: %d)", p.id, len(h.browsers))
+		// Tell browser if Python is already connected
+		if h.python != nil {
+			p.sendMsg(SignalMsg{Type: "peer_ready", Role: "python"})
+			// Tell Python about the new browser
+			h.python.sendMsg(SignalMsg{Type: "peer_ready", Role: "browser", FromPeer: p.id})
 		}
 	}
 }
 
-func handleBinary(peer *Peer, data []byte) {
-	if len(data) < 1 {
-		return
-	}
+func (h *Hub) remove(p *Peer) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 
-	switch data[0] {
-	case MsgTypeTwist:
-		handleTwist(peer, data)
-	case MsgTypeTwistAck:
-		handleAck(peer, data)
-	case MsgTypeClockSyncRequest:
-		handleClockSync(peer, data)
-	}
-}
-
-/*
-handleTwist processes Twist from browser and forwards to Python.
-
-Browser sends 65 bytes:
-  [0]     type (0x01)
-  [1-8]   message_id (uint64)
-  [9-16]  t1_browser_send (uint64)
-  [17-64] velocities (6 × float64)
-
-Relay appends 16 bytes before forwarding (total 81 bytes):
-  [65-72] t2_relay_rx (uint64)
-  [73-80] t3_relay_tx (uint64)
-
-BINARY ENCODING EXPLAINED:
---------------------------
-binary.LittleEndian.PutUint64(buf[65:], t2)
-
-This writes t2 as 8 bytes starting at offset 65:
-  - Takes the uint64 value
-  - Splits into 8 bytes, least significant first
-  - Example: 0x0102030405060708 becomes [08, 07, 06, 05, 04, 03, 02, 01]
-*/
-// popcount returns the number of set bits in a byte
-func popcount(b byte) int {
-	count := 0
-	for b != 0 {
-		count += int(b & 1)
-		b >>= 1
-	}
-	return count
-}
-
-func handleTwist(peer *Peer, data []byte) {
-	t2 := currentTimeMs() // Relay receive time
-
-	if len(data) < TwistHeaderSize {
-		log.Printf("Invalid twist size: %d (min %d)", len(data), TwistHeaderSize)
-		return
-	}
-
-	// Read field_mask at offset 17 to determine expected size
-	fieldMask := data[17]
-	numFields := popcount(fieldMask)
-	expectedSize := TwistHeaderSize + numFields*8
-
-	if len(data) < expectedSize {
-		log.Printf("Twist too short: %d bytes (mask=0x%02x needs %d)", len(data), fieldMask, expectedSize)
-		return
-	}
-
-	python := manager.getPython()
-	if python == nil {
-		log.Printf("No Python peer")
-		return
-	}
-
-	// Create extended message: original + t2 + t3
-	extendedSize := expectedSize + TwistRelayAppend
-	extended := make([]byte, extendedSize)
-	copy(extended, data[:expectedSize])
-
-	// Append relay timestamps at end of message
-	t3 := currentTimeMs()
-	binary.LittleEndian.PutUint64(extended[expectedSize:], t2)
-	binary.LittleEndian.PutUint64(extended[expectedSize+8:], t3)
-
-	// Send to Python
-	select {
-	case python.SendChan <- extended:
-		msgID := binary.LittleEndian.Uint64(data[1:9])
-		log.Printf("→ Python: Twist #%d (%dB, mask=0x%02x, t2=%d, t3=%d)", msgID, extendedSize, fieldMask, t2, t3)
-	default:
-		log.Printf("Python send buffer full")
-	}
-}
-
-/*
-handleAck processes Ack from Python and forwards to browser.
-
-Python sends 69 bytes:
-
-	[0]     type (0x02)
-	[1-8]   message_id
-	[9-16]  t1_browser_send
-	[17-24] t2_relay_rx
-	[25-32] t3_relay_tx
-	[33-40] t3_python_rx
-	[41-48] t4_python_ack
-	[49-52] python_decode_us (uint32)
-	[53-56] python_process_us (uint32)
-	[57-60] python_encode_us (uint32)
-	[61-68] reserved (for t4_relay_ack_rx)
-
-Relay fills reserved field and appends t5 (total 77 bytes):
-
-	[61-68] t4_relay_ack_rx (relay fills this)
-	[69-76] t5_relay_ack_tx (relay appends)
-*/
-func handleAck(peer *Peer, data []byte) {
-	t4 := currentTimeMs() // Relay ack receive time
-
-	if peer.Type != "python" {
-		return
-	}
-
-	if len(data) < AckFromPythonSize {
-		log.Printf("Invalid ack size: %d bytes (expected %d)", len(data), AckFromPythonSize)
-		return
-	}
-
-	// Create extended ack for browser
-	extended := make([]byte, AckToBrowserSize)
-	copy(extended, data[:AckFromPythonSize])
-
-	// Fill t4_relay_ack_rx at offset 61 and append t5 at offset 69
-	t5 := currentTimeMs()
-	binary.LittleEndian.PutUint64(extended[61:69], t4)
-	binary.LittleEndian.PutUint64(extended[69:77], t5)
-
-	// Forward to all web peers
-	webPeers := manager.getWebPeers()
-	for _, web := range webPeers {
-		select {
-		case web.SendChan <- extended:
-		default:
+	if p.role == "python" {
+		if h.python != nil && h.python.id == p.id {
+			h.python = nil
+		}
+		log.Printf("[signal] - python  %s", p.id)
+		for _, b := range h.browsers {
+			b.sendMsg(SignalMsg{Type: "peer_disconnected", Role: "python"})
+		}
+	} else {
+		delete(h.browsers, p.id)
+		log.Printf("[signal] - browser %s  (remaining: %d)", p.id, len(h.browsers))
+		if h.python != nil {
+			h.python.sendMsg(SignalMsg{Type: "peer_disconnected", Role: "browser", FromPeer: p.id})
 		}
 	}
-
-	msgID := binary.LittleEndian.Uint64(data[1:9])
-	log.Printf("← Browser: Ack #%d to %d peers (t4=%d, t5=%d)", msgID, len(webPeers), t4, t5)
 }
 
-/*
-handleClockSync responds to clock sync requests.
+// dispatch routes a signaling message from src to the appropriate target.
+func (h *Hub) dispatch(src *Peer, msg SignalMsg) {
+	h.mu.RLock()
+	py := h.python
+	h.mu.RUnlock()
 
-Request (9 bytes):
+	switch msg.Type {
+	case "offer":
+		// Browser → Python
+		if py == nil {
+			log.Printf("[signal] offer from %s — no Python connected", src.id)
+			return
+		}
+		msg.FromPeer = src.id
+		py.sendMsg(msg)
+		log.Printf("[signal] offer %s → python", src.id)
 
-	[0]   type (0x03)
-	[1-8] t1 (client send time)
+	case "answer":
+		// Python → specific browser
+		h.mu.RLock()
+		browser := h.browsers[msg.ToPeer]
+		h.mu.RUnlock()
+		if browser == nil {
+			log.Printf("[signal] answer — browser %q not found", msg.ToPeer)
+			return
+		}
+		targetID := msg.ToPeer
+		msg.ToPeer = "" // strip routing before forwarding
+		browser.sendMsg(msg)
+		log.Printf("[signal] answer python → %s", targetID)
 
-Response (25 bytes):
+	case "ice_candidate":
+		if src.role == "browser" {
+			// Browser ICE → Python
+			if py == nil {
+				return
+			}
+			msg.FromPeer = src.id
+			py.sendMsg(msg)
+		} else {
+			// Python ICE → specific browser
+			h.mu.RLock()
+			browser := h.browsers[msg.ToPeer]
+			h.mu.RUnlock()
+			if browser == nil {
+				return
+			}
+			msg.ToPeer = ""
+			browser.sendMsg(msg)
+		}
 
-	[0]    type (0x04)
-	[1-8]  t1 (echoed)
-	[9-16] t2 (server receive time)
-	[17-24] t3 (server send time)
+	default:
+		log.Printf("[signal] unknown type %q from %s", msg.Type, src.id)
+	}
+}
 
-NTP-STYLE OFFSET CALCULATION (done by client):
+// ─── HTTP ─────────────────────────────────────────────────────────────────────
 
-	RTT = (t4 - t1) - (t3 - t2)
-	Offset = ((t2 - t1) + (t3 - t4)) / 2
-*/
-func handleClockSync(peer *Peer, data []byte) {
-	t2 := currentTimeMs()
+var upgrader = websocket.Upgrader{
+	CheckOrigin:     func(r *http.Request) bool { return true },
+	ReadBufferSize:  4096,
+	WriteBufferSize: 4096,
+}
 
-	if len(data) < ClockSyncReqSize {
+func handleSignal(w http.ResponseWriter, r *http.Request) {
+	role := r.URL.Query().Get("role")
+	if role != "python" {
+		role = "browser"
+	}
+
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("[signal] upgrade error: %v", err)
 		return
 	}
 
-	t1 := binary.LittleEndian.Uint64(data[1:9])
-	t3 := currentTimeMs()
-
-	resp := make([]byte, ClockSyncRespSize)
-	resp[0] = MsgTypeClockSyncResp
-	binary.LittleEndian.PutUint64(resp[1:], t1)
-	binary.LittleEndian.PutUint64(resp[9:], t2)
-	binary.LittleEndian.PutUint64(resp[17:], t3)
-
-	select {
-	case peer.SendChan <- resp:
-		log.Printf("Clock sync: t1=%d t2=%d t3=%d", t1, t2, t3)
-	default:
+	peer := &Peer{
+		id:   newPeerID(role),
+		role: role,
+		conn: conn,
+		send: make(chan []byte, 64),
+		hub:  hub,
 	}
+
+	hub.add(peer)
+	defer func() {
+		hub.remove(peer)
+		conn.Close()
+	}()
+
+	// Send welcome first so client knows its ID
+	peer.sendMsg(SignalMsg{Type: "welcome", PeerID: peer.id, Role: role})
+
+	go peer.writeLoop()
+	peer.readLoop() // blocks until disconnect
 }
 
-// HTTP handlers
 func handleHealth(w http.ResponseWriter, r *http.Request) {
+	hub.mu.RLock()
+	pythonOK := hub.python != nil
+	browsers := len(hub.browsers)
+	hub.mu.RUnlock()
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status": "ok",
-		"time":   currentTimeMs(),
+		"status":           "ok",
+		"time_ms":          time.Now().UnixMilli(),
+		"python_connected": pythonOK,
+		"browser_count":    browsers,
 	})
 }
 
 func handleStatus(w http.ResponseWriter, r *http.Request) {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
+	hub.mu.RLock()
+	defer hub.mu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"total_peers":      len(manager.peers),
-		"web_peers":        len(manager.webPeers),
-		"python_connected": manager.pythonPeer != nil,
+		"mode":             "webrtc_signaling",
+		"python_connected": hub.python != nil,
+		"browser_count":    len(hub.browsers),
 	})
 }
 
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
 }
+
+// ─── Main ────────────────────────────────────────────────────────────────────
 
 func main() {
 	port := os.Getenv("PORT")
@@ -459,21 +364,18 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ws/data", handleWS)
+	mux.HandleFunc("/ws/signal", handleSignal)
 	mux.HandleFunc("/health", handleHealth)
 	mux.HandleFunc("/status", handleStatus)
 	mux.Handle("/", http.FileServer(http.Dir("../web-client")))
 
 	fmt.Println()
-	fmt.Println("Binary Message Sizes:")
-	fmt.Println("  0x01 Twist:    65B (browser) → 81B (to Python)")
-	fmt.Println("  0x02 Ack:      69B (Python)  → 77B (to browser)")
-	fmt.Println("  0x03 SyncReq:   9B")
-	fmt.Println("  0x04 SyncResp: 25B")
-	fmt.Println()
 	fmt.Printf("Listening on :%s\n", port)
-	fmt.Println("  WS  /ws/data  - Binary data")
-	fmt.Println("  GET /         - Web client")
+	fmt.Println("  WS  /ws/signal?role=python   Python peer")
+	fmt.Println("  WS  /ws/signal?role=browser  Browser peer")
+	fmt.Println("  GET /health                  Health check")
+	fmt.Println("  GET /status                  Status JSON")
+	fmt.Println()
 
 	log.Fatal(http.ListenAndServe(":"+port, corsMiddleware(mux)))
 }
