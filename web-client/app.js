@@ -113,7 +113,6 @@ let myPeerId = '';   // assigned by Go on connect
 
 let connected = false;
 let msgId = 0;
-let history = [];
 let linY = 0, angZ = 0;
 let currentSpeed = CONFIG.defaultSpeed;
 let fieldMask = FIELD_LINEAR_Y | FIELD_ANGULAR_Z;
@@ -236,34 +235,199 @@ function decodeSyncResp(buf) {
     };
 }
 
-// ============ CHART ============
+// ============ CHART STATE ============
+// uPlot instance
+let uplot = null;
 
-let chart = null;
+// Columnar data arrays — uPlot's native format.
+// uData[0] = timestamps in seconds (x-axis)
+// uData[1] = RTT ms
+// uData[2] = →Python ms
+// uData[3] = Python proc ms
+// uData[4] = ←Python ms
+// Each push adds one point; old points beyond chartWindowSec are trimmed.
+let uData = [[], [], [], [], []];
 
+// ============ CHART (uPlot) ============
+
+/**
+ * initChart()
+ * -----------
+ * Replaces the old Chart.js canvas with a uPlot instance.
+ *
+ * WHY uPlot:
+ *   Chart.js redraws the entire canvas on every frame and uses string labels
+ *   on the x-axis, making it impossible to zoom into exact millisecond values.
+ *   uPlot stores data as columnar Float64 arrays, renders with a single WebGL-
+ *   style canvas pass, and uses real numeric x-values — so the crosshair cursor
+ *   always shows the exact timestamp and all four series values at that point.
+ *
+ * INTERACTIVE FEATURES ENABLED:
+ *   • Scroll wheel          — zoom x-axis in/out around cursor position
+ *   • Click + drag left     — drag-to-zoom a specific time window
+ *   • Click + drag right    — pan the zoomed view
+ *   • Hover crosshair       — snaps to nearest data point, shows all series
+ *   • Legend                — click a series label to hide/show it
+ *   • Reset Zoom button     — restores the full 20-second rolling window
+ *
+ * DATA FORMAT:
+ *   uPlot requires columnar arrays: data[0] = x values (seconds),
+ *   data[1..N] = one array per series. We keep them in uData[] and call
+ *   uplot.setData(uData) on every incoming ack (~20 Hz).
+ */
 function initChart() {
-    const ctx = document.getElementById('chart').getContext('2d');
-    chart = new Chart(ctx, {
-        type: 'line',
-        data: {
-            labels: [],
-            datasets: [
-                { label: 'RTT',            data: [], borderColor: '#00f5d4', backgroundColor: 'rgba(0,245,212,0.1)', fill: true, tension: 0.3, pointRadius: 0 },
-                { label: '→Python',        data: [], borderColor: '#f72585', tension: 0.3, pointRadius: 0 },
-                { label: 'Python proc',    data: [], borderColor: '#4361ee', tension: 0.3, pointRadius: 0 },
-                { label: '←Python',        data: [], borderColor: '#ff6b35', tension: 0.3, pointRadius: 0 },
-            ]
+    const wrap = document.getElementById('chart');
+
+    // Series colours match the existing dashboard palette
+    const CYAN    = '#00f5d4';
+    const MAGENTA = '#f72585';
+    const BLUE    = '#4361ee';
+    const ORANGE  = '#ff6b35';
+    const GRID    = 'rgba(42,42,58,0.6)';
+    const TICK    = '#8a8a9a';
+
+    const opts = {
+        width:  wrap.clientWidth || 800,
+        height: 260,
+
+        // ── Cursor ──────────────────────────────────────────────────────────
+        // "focus" mode dims non-hovered series so you can isolate one line.
+        // "drag" enables rubber-band zoom on left-drag, pan on right-drag.
+        cursor: {
+            show:  true,
+            x:     true,
+            y:     true,
+            focus: { prox: 16 },
+            drag:  { x: true, y: false, dist: 8, uni: 20 },
         },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            animation: false,
-            scales: {
-                x: { grid: { color: 'rgba(42,42,58,0.5)' }, ticks: { color: '#8a8a9a', maxTicksLimit: 8 } },
-                y: { grid: { color: 'rgba(42,42,58,0.5)' }, ticks: { color: '#8a8a9a' }, min: 0 }
+
+        // ── Scales ──────────────────────────────────────────────────────────
+        scales: {
+            // x: raw seconds (we format as relative "-N.Ns" in the axis)
+            x: { time: false },
+            // y: always starts at 0; upper bound is 10% above the max visible value
+            y: {
+                range: (_u, dataMin, dataMax) => [0, Math.max((dataMax || 0) * 1.15, 10)],
             },
-            plugins: { legend: { labels: { color: '#8a8a9a', usePointStyle: true, padding: 12 } } }
-        }
-    });
+        },
+
+        // ── Axes ────────────────────────────────────────────────────────────
+        axes: [
+            {
+                // X axis — show relative time (seconds ago) so it reads like a
+                // rolling window even when the view is zoomed or panned
+                stroke: TICK,
+                grid:  { stroke: GRID, width: 1 },
+                ticks: { stroke: GRID, width: 1 },
+                size:  32,
+                values: (u, vals) => {
+                    const latest = u.data[0].length
+                        ? u.data[0][u.data[0].length - 1]
+                        : 0;
+                    return vals.map(v =>
+                        v == null ? '' : `-${(latest - v).toFixed(1)}s`
+                    );
+                },
+            },
+            {
+                // Y axis — ms values with one decimal place
+                stroke: TICK,
+                grid:  { stroke: GRID, width: 1 },
+                ticks: { stroke: GRID, width: 1 },
+                size:  52,
+                values: (_u, vals) =>
+                    vals.map(v => v == null ? '' : `${v.toFixed(1)}`),
+                label:  'ms',
+                labelSize: 14,
+                labelFont: '11px Space Grotesk',
+                font:      '11px Space Grotesk',
+            },
+        ],
+
+        // ── Series ──────────────────────────────────────────────────────────
+        // series[0] is always the x-axis descriptor (no stroke).
+        // Remaining entries match uData[1..4].
+        series: [
+            {},
+            {
+                label:  'RTT',
+                stroke: CYAN,
+                fill:   'rgba(0,245,212,0.07)',
+                width:  2,
+                // show value in cursor tooltip with ms unit
+                value:  (_u, v) => v == null ? '--' : `${v.toFixed(2)} ms`,
+            },
+            {
+                label:  '→Python',
+                stroke: MAGENTA,
+                width:  1.5,
+                value:  (_u, v) => v == null ? '--' : `${v.toFixed(2)} ms`,
+            },
+            {
+                label:  'Python proc',
+                stroke: BLUE,
+                width:  1.5,
+                value:  (_u, v) => v == null ? '--' : `${v.toFixed(2)} ms`,
+            },
+            {
+                label:  '←Python',
+                stroke: ORANGE,
+                width:  1.5,
+                value:  (_u, v) => v == null ? '--' : `${v.toFixed(2)} ms`,
+            },
+        ],
+
+        // ── Legend ──────────────────────────────────────────────────────────
+        // uPlot's built-in legend updates every series value live as the cursor
+        // moves — this is the "per-ms resolution" inspection capability.
+        legend: { show: true, live: true },
+    };
+
+    uplot = new uPlot(opts, uData, wrap);
+
+    // ── Scroll-wheel zoom ────────────────────────────────────────────────────
+    // uPlot's drag-to-zoom handles click-drag; wheel zoom must be wired manually.
+    // We zoom the x-scale around the cursor's horizontal position so the point
+    // under the mouse stays fixed while the window expands or contracts.
+    wrap.addEventListener('wheel', e => {
+        e.preventDefault();
+        if (!uplot) return;
+
+        const xMin = uplot.scales.x.min;
+        const xMax = uplot.scales.x.max;
+        const range = xMax - xMin;
+
+        // factor < 1 = zoom in, factor > 1 = zoom out
+        const factor = e.deltaY < 0 ? 0.75 : 1.33;
+
+        // What fraction along the x-axis is the cursor?
+        const rect = uplot.root.getBoundingClientRect();
+        const pct  = Math.max(0, Math.min(1,
+            (e.clientX - rect.left - uplot.bbox.left) / uplot.bbox.width
+        ));
+
+        const center  = xMin + pct * range;
+        const newRange = range * factor;
+        uplot.setScale('x', {
+            min: center - pct * newRange,
+            max: center + (1 - pct) * newRange,
+        });
+    }, { passive: false });
+
+    // ── Resize observer ──────────────────────────────────────────────────────
+    // Keeps the chart filling the panel when the browser window is resized.
+    new ResizeObserver(() => {
+        if (uplot) uplot.setSize({ width: wrap.clientWidth, height: 260 });
+    }).observe(wrap);
+}
+
+/** resetZoom() — restores the full rolling window view after the user has
+ *  zoomed or panned. Called by the "Reset Zoom" button. */
+function resetZoom() {
+    if (!uplot || !uData[0].length) return;
+    const latest  = uData[0][uData[0].length - 1];
+    const earliest = uData[0][0];
+    uplot.setScale('x', { min: earliest, max: latest });
 }
 
 // ============ WEBRTC SIGNALING + CONNECTION ============
@@ -311,7 +475,7 @@ async function connect() {
     dc.binaryType = 'arraybuffer';
 
     dc.onopen = async () => {
-        logInfo('webrtc', 'DataChannel open — P2P established (Go is idle)');
+        logInfo('webrtc', '🟢 DataChannel open — P2P established (Go is idle)');
         setConnected(true);
 
         // Initial clock sync — Python will now respond directly
@@ -717,17 +881,35 @@ function updateMetrics(lat) {
 }
 
 function updateChart(lat, now) {
-    if (!chart) return;
-    const cutoff = now - CONFIG.chartWindowSec * 1000;
-    history.push({ time: now, ...lat });
-    history = history.filter(d => d.time > cutoff);
+    if (!uplot) return;
 
-    chart.data.labels = history.map(d => `-${((now - d.time)/1000).toFixed(1)}s`);
-    chart.data.datasets[0].data = history.map(d => d.rtt);
-    chart.data.datasets[1].data = history.map(d => d.toPython);
-    chart.data.datasets[2].data = history.map(d => d.pythonMs);
-    chart.data.datasets[3].data = history.map(d => d.fromPython);
-    chart.update('none');
+    // uPlot x-axis uses seconds, not milliseconds
+    const t = now / 1000;
+    const cutoff = t - CONFIG.chartWindowSec;
+
+    // Append new point to each column
+    uData[0].push(t);
+    uData[1].push(lat.rtt);
+    uData[2].push(lat.toPython);
+    uData[3].push(lat.pythonMs);
+    uData[4].push(lat.fromPython);
+
+    // Trim points older than the rolling window from the front.
+    // We find the first index still within the window and slice all columns.
+    let start = 0;
+    while (start < uData[0].length && uData[0][start] < cutoff) start++;
+    if (start > 0) {
+        uData[0] = uData[0].slice(start);
+        uData[1] = uData[1].slice(start);
+        uData[2] = uData[2].slice(start);
+        uData[3] = uData[3].slice(start);
+        uData[4] = uData[4].slice(start);
+    }
+
+    // Push columnar data to uPlot.
+    // setData(data, resetScales=false) redraws without touching the zoom state,
+    // so a user mid-zoom won't have their view snapped back on every ack.
+    uplot.setData(uData, false);
 }
 
 function updateBreakdown(lat) {
@@ -838,13 +1020,15 @@ function init() {
     setupSpeedControl();
     setupFieldSelector();
 
-    const connectBtn = document.getElementById('connectBtn');
-    const stopBtn    = document.getElementById('stopBtn');
-    const syncBtn    = document.getElementById('syncBtn');
+    const connectBtn   = document.getElementById('connectBtn');
+    const stopBtn      = document.getElementById('stopBtn');
+    const syncBtn      = document.getElementById('syncBtn');
+    const resetZoomBtn = document.getElementById('resetZoomBtn');
 
-    if (connectBtn) connectBtn.onclick = () => connected ? disconnect() : connect();
-    if (stopBtn)    stopBtn.onclick    = sendStop;
-    if (syncBtn)    syncBtn.onclick    = sendSyncReq;
+    if (connectBtn)   connectBtn.onclick   = () => connected ? disconnect() : connect();
+    if (stopBtn)      stopBtn.onclick      = sendStop;
+    if (syncBtn)      syncBtn.onclick      = sendSyncReq;
+    if (resetZoomBtn) resetZoomBtn.onclick = resetZoom;
 
     updateBreakdown({});
 

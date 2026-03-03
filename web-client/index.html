@@ -4,7 +4,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Teleop Latency Dashboard</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- uPlot: lightweight, high-performance time-series chart with built-in
+         cursor crosshair, scroll-wheel zoom, drag-to-zoom, and per-ms tooltip -->
+    <link  rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Space+Grotesk:wght@400;600&display=swap');
         
@@ -102,7 +105,7 @@
         }
         .panel-body { padding: 16px; }
         
-        .chart-wrap { height: 260px; }
+        .chart-wrap { height: 260px; overflow: hidden; }
         
         .metrics {
             display: grid;
@@ -455,9 +458,17 @@
         <div class="main">
             <div class="left">
                 <div class="panel">
-                    <div class="panel-header">RTT Latency (20s)</div>
+                    <div class="panel-header" style="display:flex;justify-content:space-between;align-items:center;">
+                        <span>RTT Latency (20s) — scroll to zoom · drag to pan</span>
+                        <button id="resetZoomBtn" style="
+                            padding:3px 10px;font-size:10px;font-family:inherit;
+                            background:var(--bg);color:var(--text2);
+                            border:1px solid var(--border);border-radius:4px;
+                            cursor:pointer;letter-spacing:.3px;">Reset Zoom</button>
+                    </div>
                     <div class="panel-body">
-                        <div class="chart-wrap"><canvas id="chart"></canvas></div>
+                        <!-- uPlot injects its own <canvas> into this div -->
+                        <div id="chart" class="chart-wrap"></div>
                         <div class="metrics">
                             <div class="metric"><div class="metric-label">Total RTT</div><div class="metric-val" id="mRtt">--<span class="metric-unit">ms</span></div></div>
                             <div class="metric m"><div class="metric-label">Browser→Python</div><div class="metric-val" id="mBR">--<span class="metric-unit">ms</span></div></div>
