@@ -86,7 +86,7 @@ function popcount(mask) {
 // ============ CONFIG ============
 const CONFIG = {
     // Signaling server (Go) — ONLY for WebRTC handshake
-    signalUrl: `ws://${location.hostname || 'localhost'}:8080/ws/signal?role=browser`,
+    signalUrl: `ws://${location.hostname || 'localhost'}:8081/ws/signal?role=browser`,
 
     sendHz: 20,
     chartWindowSec: 20,
