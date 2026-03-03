@@ -105,14 +105,6 @@ const CONFIG = {
 
 // ============ HIGH-RESOLUTION CLOCK ============
 /**
- * now() — returns milliseconds since Unix epoch with sub-ms precision.
- *
- * WHY NOT Date.now():
- *   Date.now() has 1ms resolution and is a wall-clock that can be adjusted
- *   by NTP or the OS at any time.  More critically, it is read *after* the
- *   JS event loop schedules the callback, so a GC pause or rendering frame
- *   adds its full delay to the reading.
- *
  *   performance.now() is a monotonic clock with 0.1μs resolution.
  *   It cannot jump backwards and is immune to NTP adjustments.
  *
