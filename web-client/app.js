@@ -1,45 +1,62 @@
 /**
- * Teleop Latency Dashboard - Binary Protocol
- * 
- * BINARY ENCODING IN JAVASCRIPT
- * ==============================
- * 
- * JavaScript uses ArrayBuffer and DataView for binary data:
- * 
- * ArrayBuffer: Raw binary buffer (fixed size)
- * DataView: Interface to read/write typed values
- * 
- * ENCODING EXAMPLE:
- * -----------------
- * const buf = new ArrayBuffer(65);  // 65 bytes
- * const view = new DataView(buf);
- * 
- * // Write uint8 at offset 0
- * view.setUint8(0, 0x01);
- * 
- * // Write uint64 at offset 1 (little-endian = true)
- * view.setBigUint64(1, BigInt(12345), true);
- * 
- * // Write float64 at offset 9 (little-endian = true)
- * view.setFloat64(9, 1.5, true);
- * 
- * DECODING EXAMPLE:
- * -----------------
- * const type = view.getUint8(0);
- * const msgId = Number(view.getBigUint64(1, true));
- * const value = view.getFloat64(9, true);
- * 
- * ENDIANNESS:
- * -----------
- * Little-endian: Least significant byte first
- *   - 0x1234 stored as [0x34, 0x12]
- *   - Pass 'true' as last argument to DataView methods
+ * Teleop Latency Dashboard — WebRTC P2P Edition
+ * ===============================================
+ *
+ * TRANSPORT LAYER CHANGE (from original WebSocket relay):
+ * -------------------------------------------------------
+ * The original code sent all binary data (Twist, Ack, ClockSync) through
+ * a Go WebSocket relay server.  This version uses:
+ *
+ *   1. sigWs  — A WebSocket to the Go *signaling* server only.
+ *               Used just to exchange SDP offer/answer and ICE candidates.
+ *               After the handshake it becomes idle.
+ *
+ *   2. dc     — An RTCDataChannel connected directly to the Python process.
+ *               All binary robot-control data flows here, P2P.
+ *
+ * BINARY PROTOCOL CHANGES:
+ * ------------------------
+ * Outbound (Browser → Python):
+ *   0x01 Twist:       18 + 8×N bytes (unchanged)
+ *   0x03 ClockSyncReq: 9 bytes       (unchanged, now Python responds)
+ *
+ * Inbound (Python → Browser):
+ *   0x02 P2P Ack:     45 bytes (NEW — no relay timestamps)
+ *   0x04 ClockSyncResp: 25 bytes (unchanged)
+ *
+ * P2P Ack layout (45 bytes):
+ *   [0]     uint8   type (0x02)
+ *   [1-8]   uint64  message_id
+ *   [9-16]  uint64  t1_browser_send
+ *   [17-24] uint64  t3_python_rx  (Python clock)
+ *   [25-32] uint64  t4_python_ack (Python clock)
+ *   [33-36] uint32  python_decode_us
+ *   [37-40] uint32  python_process_us
+ *   [41-44] uint32  python_encode_us
+ *
+ * LATENCY MODEL (P2P):
+ * --------------------
+ *   t1  Browser sends Twist          (browser clock)
+ *   t3p Python receives Twist        (Python clock; convert via clockOffset)
+ *   t4p Python sends Ack             (Python clock)
+ *   t6  Browser receives Ack         (browser clock)
+ *
+ *   RTT                = t6 - t1                          (browser clock, exact)
+ *   one_way_to_python  = (t3p - clockOffset) - t1         (needs clock sync)
+ *   python_processing  = (decode_us + process_us + encode_us) / 1000  ms
+ *   one_way_return     = t6 - (t4p - clockOffset)         (needs clock sync)
+ *
+ * JAVASCRIPT BINARY ENCODING:
+ * ----------------------------
+ * ArrayBuffer + DataView, little-endian (true flag on all set/get calls).
+ * BigInt required for uint64 values.  Math.floor() before BigInt to avoid
+ * fractional-integer crashes.
  */
 
 // ============ MESSAGE TYPES ============
-const MSG_TWIST = 0x01;
-const MSG_ACK = 0x02;
-const MSG_SYNC_REQ = 0x03;
+const MSG_TWIST     = 0x01;
+const MSG_ACK       = 0x02;
+const MSG_SYNC_REQ  = 0x03;
 const MSG_SYNC_RESP = 0x04;
 
 // ============ FIELD MASK BITS ============
@@ -68,7 +85,9 @@ function popcount(mask) {
 
 // ============ CONFIG ============
 const CONFIG = {
-    wsUrl: `ws://${location.hostname || 'localhost'}:8080/ws/data?type=web`,
+    // Signaling server (Go) — ONLY for WebRTC handshake
+    signalUrl: `ws://${location.hostname || 'localhost'}:8080/ws/signal?role=browser`,
+
     sendHz: 20,
     chartWindowSec: 20,
     syncIntervalMs: 10000,
@@ -76,107 +95,78 @@ const CONFIG = {
     maxSpeed: 8.0,
     defaultSpeed: 1.0,
     keyRepeatMs: 50,
-    // Logging control - set to true for verbose debug output
+
+    // WebRTC configuration
+    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+
+    // Set true to enable verbose console output
     debugLog: false,
 };
 
 // ============ STATE ============
-let ws = null;
+// Signaling WebSocket (Go server — ephemeral, stays connected for ICE)
+let sigWs = null;
+// WebRTC peer connection and data channel
+let pc = null;
+let dc = null;
+let myPeerId = '';   // assigned by Go on connect
+
 let connected = false;
 let msgId = 0;
 let history = [];
 let linY = 0, angZ = 0;
 let currentSpeed = CONFIG.defaultSpeed;
-let fieldMask = FIELD_LINEAR_Y | FIELD_ANGULAR_Z;  // Default: only the fields you need
+let fieldMask = FIELD_LINEAR_Y | FIELD_ANGULAR_Z;
 let sendTimer = null;
 
 // Keyboard state
 let keysPressed = new Set();
 let keyTimer = null;
 
-// Clock sync
+// Clock sync (now syncs to Python directly via DataChannel)
 let clockOffset = 0, clockRtt = 0, clockSynced = false;
 let offsets = [];
 
 // Stats
 let ackCount = 0;
-let lastAckTime = 0;
 
 // ============ LOGGING HELPERS ============
 
-/**
- * Structured logger with categories for easy filtering in browser console.
- * Filter in Chrome DevTools: type "[sync]" or "[send]" or "[ack]" in filter box.
- */
-function logDebug(category, msg, data) {
+function logDebug(cat, msg, data) {
     if (!CONFIG.debugLog) return;
-    if (data !== undefined) {
-        console.debug(`[${category}] ${msg}`, data);
-    } else {
-        console.debug(`[${category}] ${msg}`);
-    }
+    data !== undefined ? console.debug(`[${cat}] ${msg}`, data) : console.debug(`[${cat}] ${msg}`);
 }
-
-function logInfo(category, msg, data) {
-    if (data !== undefined) {
-        console.log(`[${category}] ${msg}`, data);
-    } else {
-        console.log(`[${category}] ${msg}`);
-    }
+function logInfo(cat, msg, data) {
+    data !== undefined ? console.log(`[${cat}] ${msg}`, data) : console.log(`[${cat}] ${msg}`);
 }
-
-function logWarn(category, msg, data) {
-    if (data !== undefined) {
-        console.warn(`[${category}] ${msg}`, data);
-    } else {
-        console.warn(`[${category}] ${msg}`);
-    }
+function logWarn(cat, msg, data) {
+    data !== undefined ? console.warn(`[${cat}] ${msg}`, data) : console.warn(`[${cat}] ${msg}`);
 }
-
-function logError(category, msg, data) {
-    if (data !== undefined) {
-        console.error(`[${category}] ${msg}`, data);
-    } else {
-        console.error(`[${category}] ${msg}`);
-    }
+function logError(cat, msg, data) {
+    data !== undefined ? console.error(`[${cat}] ${msg}`, data) : console.error(`[${cat}] ${msg}`);
 }
 
 // ============ BINARY ENCODING ============
 
 /**
- * Encode Twist message (variable size: 18 + 8×N bytes)
- * 
- * HEADER (18 bytes):
- *   [0]     uint8   type (0x01)
- *   [1-8]   uint64  message_id
- *   [9-16]  uint64  t1_browser_send
- *   [17]    uint8   field_mask
- * 
- * PAYLOAD (8 bytes per set bit):
- *   Only included fields, in order: lx, ly, lz, ax, ay, az
- * 
- * Examples:
- *   mask=0x22 (linear.y + angular.z) → 34 bytes
- *   mask=0x3F (all fields)           → 66 bytes
+ * Encode Twist message (variable size: 18 + 8×N bytes).
+ *
+ * In P2P mode t1 is just Date.now() — no relay clock offset needed.
+ * RTT = t6_receive - t1_send is measured entirely in browser time.
  */
 function encodeTwist(id, t1, velocities) {
     const numFields = popcount(fieldMask);
     const size = 18 + numFields * 8;
     const buf = new ArrayBuffer(size);
     const v = new DataView(buf);
-    
-    // FIX: Math.floor() before BigInt — clockOffset is a float, so
-    // Date.now() + clockOffset can be fractional (e.g. 1770319313923.5)
-    // BigInt() requires an exact integer, hence the crash.
+
     const t1_int = Math.floor(t1);
-    
-    // Header
+
     v.setUint8(0, MSG_TWIST);
     v.setBigUint64(1, BigInt(Math.floor(id)), true);
     v.setBigUint64(9, BigInt(t1_int), true);
     v.setUint8(17, fieldMask);
-    
-    // Payload: only selected fields
+
     const allValues = [velocities.lx, velocities.ly, velocities.lz,
                        velocities.ax, velocities.ay, velocities.az];
     let offset = 18;
@@ -186,86 +176,62 @@ function encodeTwist(id, t1, velocities) {
             offset += 8;
         }
     }
-    
+
     logDebug('encode', `twist msg=${id} t1=${t1_int} size=${size}B mask=0x${fieldMask.toString(16)}`);
-    
     return buf;
 }
 
 /**
- * Decode Twist Ack (77 bytes)
- * 
+ * Decode P2P Ack (45 bytes) — no relay timestamp fields.
+ *
  * Layout:
  *   [0]     uint8   type (0x02)
  *   [1-8]   uint64  message_id
  *   [9-16]  uint64  t1_browser_send
- *   [17-24] uint64  t2_relay_rx
- *   [25-32] uint64  t3_relay_tx
- *   [33-40] uint64  t3_python_rx
- *   [41-48] uint64  t4_python_ack
- *   [49-52] uint32  python_decode_us
- *   [53-56] uint32  python_process_us
- *   [57-60] uint32  python_encode_us
- *   [61-68] uint64  t4_relay_ack_rx
- *   [69-76] uint64  t5_relay_ack_tx
+ *   [17-24] uint64  t3_python_rx
+ *   [25-32] uint64  t4_python_ack
+ *   [33-36] uint32  python_decode_us
+ *   [37-40] uint32  python_process_us
+ *   [41-44] uint32  python_encode_us
  */
 function decodeAck(buf) {
     const v = new DataView(buf);
-    
-    // Validate buffer size
-    if (buf.byteLength < 77) {
-        logError('decode', `ack buffer too small: ${buf.byteLength} bytes, expected 77`);
+
+    if (buf.byteLength < 45) {
+        logError('decode', `ack too small: ${buf.byteLength}B (expected 45)`);
         return null;
     }
-    
-    const ack = {
-        msgId:           Number(v.getBigUint64(1, true)),
-        t1_browser:      Number(v.getBigUint64(9, true)),
-        t2_relay_rx:     Number(v.getBigUint64(17, true)),
-        t3_relay_tx:     Number(v.getBigUint64(25, true)),
-        t3_python_rx:    Number(v.getBigUint64(33, true)),
-        t4_python_ack:   Number(v.getBigUint64(41, true)),
-        decode_us:       v.getUint32(49, true),
-        process_us:      v.getUint32(53, true),
-        encode_us:       v.getUint32(57, true),
-        t4_relay_ack_rx: Number(v.getBigUint64(61, true)),
-        t5_relay_ack_tx: Number(v.getBigUint64(69, true)),
+
+    return {
+        msgId:          Number(v.getBigUint64(1,  true)),
+        t1_browser:     Number(v.getBigUint64(9,  true)),
+        t3_python_rx:   Number(v.getBigUint64(17, true)),
+        t4_python_ack:  Number(v.getBigUint64(25, true)),
+        decode_us:      v.getUint32(33, true),
+        process_us:     v.getUint32(37, true),
+        encode_us:      v.getUint32(41, true),
     };
-    
-    logDebug('decode', `ack msg=${ack.msgId}`, {
-        t1: ack.t1_browser,
-        t2: ack.t2_relay_rx,
-        t3: ack.t3_relay_tx,
-        t3py: ack.t3_python_rx,
-        t4py: ack.t4_python_ack,
-        t4rel: ack.t4_relay_ack_rx,
-        t5rel: ack.t5_relay_ack_tx,
-    });
-    
-    return ack;
 }
 
 /**
- * Encode Clock Sync Request (9 bytes)
+ * Encode Clock Sync Request (9 bytes).
+ * Identical format to relay mode — Python now handles the response.
  */
 function encodeSyncReq(t1) {
     const buf = new ArrayBuffer(9);
     const v = new DataView(buf);
     v.setUint8(0, MSG_SYNC_REQ);
-    // FIX: floor here too in case t1 is fractional
     v.setBigUint64(1, BigInt(Math.floor(t1)), true);
     logDebug('sync', `req t1=${Math.floor(t1)}`);
     return buf;
 }
 
-/**
- * Decode Clock Sync Response (25 bytes)
- */
+/** Decode Clock Sync Response (25 bytes) — unchanged from relay mode. */
 function decodeSyncResp(buf) {
     const v = new DataView(buf);
     return {
-        t1: Number(v.getBigUint64(1, true)),
-        t2: Number(v.getBigUint64(9, true)),
+        t1: Number(v.getBigUint64(1,  true)),
+        t2: Number(v.getBigUint64(9,  true)),
         t3: Number(v.getBigUint64(17, true)),
     };
 }
@@ -281,11 +247,10 @@ function initChart() {
         data: {
             labels: [],
             datasets: [
-                { label: 'RTT', data: [], borderColor: '#00f5d4', backgroundColor: 'rgba(0,245,212,0.1)', fill: true, tension: 0.3, pointRadius: 0 },
-                { label: 'Browser→Relay', data: [], borderColor: '#f72585', tension: 0.3, pointRadius: 0 },
-                { label: 'Relay→Python', data: [], borderColor: '#fee440', tension: 0.3, pointRadius: 0 },
-                { label: 'Python', data: [], borderColor: '#4361ee', tension: 0.3, pointRadius: 0 },
-                { label: 'Return', data: [], borderColor: '#ff6b35', tension: 0.3, pointRadius: 0 },
+                { label: 'RTT',            data: [], borderColor: '#00f5d4', backgroundColor: 'rgba(0,245,212,0.1)', fill: true, tension: 0.3, pointRadius: 0 },
+                { label: '→Python',        data: [], borderColor: '#f72585', tension: 0.3, pointRadius: 0 },
+                { label: 'Python proc',    data: [], borderColor: '#4361ee', tension: 0.3, pointRadius: 0 },
+                { label: '←Python',        data: [], borderColor: '#ff6b35', tension: 0.3, pointRadius: 0 },
             ]
         },
         options: {
@@ -301,186 +266,250 @@ function initChart() {
     });
 }
 
-// ============ WEBSOCKET ============
+// ============ WEBRTC SIGNALING + CONNECTION ============
 
 let syncInterval = null;
 
-function connect() {
-    if (ws) ws.close();
-    
-    logInfo('ws', `Connecting to ${CONFIG.wsUrl}`);
-    ws = new WebSocket(CONFIG.wsUrl);
-    ws.binaryType = 'arraybuffer';
-    
-    ws.onopen = async () => {
-        logInfo('ws', 'Connected');
+/**
+ * connect() — full WebRTC setup:
+ *   1. Open signaling WebSocket to Go
+ *   2. Create RTCPeerConnection + RTCDataChannel
+ *   3. Generate SDP offer, send to Go → Python
+ *   4. Receive answer and ICE candidates
+ *   5. DataChannel opens → P2P ready
+ */
+async function connect() {
+    if (sigWs) disconnect();
+
+    logInfo('webrtc', `Connecting to signaling: ${CONFIG.signalUrl}`);
+
+    // ── Signaling WebSocket ──────────────────────────────────────────────────
+    sigWs = new WebSocket(CONFIG.signalUrl);
+
+    sigWs.onclose = () => {
+        logInfo('signal', 'Signaling WebSocket closed');
+        // DataChannel may still be alive if already connected
+    };
+    sigWs.onerror = (e) => logError('signal', 'Signaling WS error', e);
+
+    // Wait for WebSocket to open before setting up RTCPeerConnection
+    await new Promise((resolve, reject) => {
+        sigWs.onopen = resolve;
+        sigWs.onerror = reject;
+    });
+
+    logInfo('signal', 'Signaling connected — waiting for peer_ready...');
+
+    // ── RTCPeerConnection ────────────────────────────────────────────────────
+    pc = new RTCPeerConnection({ iceServers: CONFIG.iceServers });
+
+    // Create DataChannel (browser is the offerer, so it creates the channel)
+    dc = pc.createDataChannel('teleop', {
+        ordered: false,           // unordered for lower latency
+        maxRetransmits: 0,        // no retransmits — fresh data preferred
+    });
+    dc.binaryType = 'arraybuffer';
+
+    dc.onopen = async () => {
+        logInfo('webrtc', 'DataChannel open — P2P established (Go is idle)');
         setConnected(true);
-        
-        // Initial clock sync - send 5 requests for robust median
-        logInfo('sync', 'Starting initial clock sync (5 samples)...');
+
+        // Initial clock sync — Python will now respond directly
+        logInfo('sync', 'Starting P2P clock sync (5 samples)...');
         for (let i = 0; i < 5; i++) {
             sendSyncReq();
             await sleep(200);
         }
-        
         if (clockSynced) {
-            logInfo('sync', `Clock sync complete: offset=${clockOffset.toFixed(1)}ms rtt=${clockRtt.toFixed(1)}ms`);
+            logInfo('sync', `Clock synced to Python: offset=${clockOffset.toFixed(1)}ms rtt=${clockRtt.toFixed(1)}ms`);
         } else {
-            logWarn('sync', `Clock sync incomplete after initial burst (${offsets.length} samples). Continuing anyway.`);
+            logWarn('sync', `Clock sync incomplete (${offsets.length}/3 samples). Continuing.`);
         }
-        
-        // Start periodic sync and message sending
+
         syncInterval = setInterval(sendSyncReq, CONFIG.syncIntervalMs);
         startSending();
     };
-    
-    ws.onclose = () => {
-        logInfo('ws', 'Disconnected');
+
+    dc.onclose = () => {
+        logInfo('webrtc', 'DataChannel closed');
         setConnected(false);
         stopSending();
         if (syncInterval) { clearInterval(syncInterval); syncInterval = null; }
     };
-    
-    ws.onerror = (e) => logError('ws', 'WebSocket error:', e);
-    
-    ws.onmessage = (e) => {
-        if (e.data instanceof ArrayBuffer) {
-            const type = new Uint8Array(e.data)[0];
-            if (type === MSG_ACK) handleAck(e.data);
-            else if (type === MSG_SYNC_RESP) handleSyncResp(e.data);
-            else logWarn('ws', `Unknown message type: 0x${type.toString(16)}`);
+
+    dc.onerror = (e) => logError('webrtc', 'DataChannel error', e);
+
+    dc.onmessage = (e) => {
+        if (!(e.data instanceof ArrayBuffer)) return;
+        const type = new Uint8Array(e.data)[0];
+        if (type === MSG_ACK)       handleAck(e.data);
+        else if (type === MSG_SYNC_RESP) handleSyncResp(e.data);
+        else logWarn('webrtc', `Unknown message type: 0x${type.toString(16)}`);
+    };
+
+    // ICE candidate → forward to Python via signaling
+    pc.onicecandidate = (e) => {
+        if (!e.candidate) return;
+        const cand = e.candidate;
+        sendSignal({
+            type: 'ice_candidate',
+            candidate: cand.candidate,
+            sdpMid: cand.sdpMid,
+            sdpMLineIndex: cand.sdpMLineIndex,
+        });
+        logDebug('ice', 'Sent local ICE candidate');
+    };
+
+    pc.onconnectionstatechange = () => {
+        logInfo('webrtc', `Connection state: ${pc.connectionState}`);
+        if (pc.connectionState === 'failed') {
+            logError('webrtc', 'Connection failed — try reconnecting');
+            setConnected(false);
         }
     };
+
+    // ── Signaling message handler ────────────────────────────────────────────
+    sigWs.onmessage = async (e) => {
+        const msg = JSON.parse(e.data);
+
+        switch (msg.type) {
+            case 'welcome':
+                myPeerId = msg.peer_id;
+                logInfo('signal', `My peer ID: ${myPeerId}`);
+                break;
+
+            case 'peer_ready':
+                if (msg.role === 'python') {
+                    logInfo('signal', 'Python peer ready — creating WebRTC offer...');
+                    await createAndSendOffer();
+                }
+                break;
+
+            case 'answer':
+                logInfo('signal', 'Received SDP answer from Python');
+                await pc.setRemoteDescription(new RTCSessionDescription({
+                    type: 'answer',
+                    sdp: msg.sdp,
+                }));
+                break;
+
+            case 'ice_candidate':
+                if (msg.candidate && pc) {
+                    try {
+                        await pc.addIceCandidate(new RTCIceCandidate({
+                            candidate: msg.candidate,
+                            sdpMid: msg.sdpMid,
+                            sdpMLineIndex: msg.sdpMLineIndex,
+                        }));
+                        logDebug('ice', 'Added remote ICE candidate');
+                    } catch (err) {
+                        logDebug('ice', `ICE candidate error (may be ok): ${err.message}`);
+                    }
+                }
+                break;
+
+            case 'peer_disconnected':
+                if (msg.role === 'python') {
+                    logWarn('signal', 'Python peer disconnected');
+                    setConnected(false);
+                    stopSending();
+                }
+                break;
+
+            default:
+                logDebug('signal', `Unknown signal: ${msg.type}`);
+        }
+    };
+}
+
+async function createAndSendOffer() {
+    if (!pc) return;
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    sendSignal({ type: 'offer', sdp: pc.localDescription.sdp });
+    logInfo('signal', 'Sent SDP offer');
+}
+
+function sendSignal(msg) {
+    if (sigWs && sigWs.readyState === WebSocket.OPEN) {
+        sigWs.send(JSON.stringify(msg));
+    }
+}
+
+function disconnect() {
+    stopSending();
+    if (syncInterval) { clearInterval(syncInterval); syncInterval = null; }
+    if (dc) { try { dc.close(); } catch(e){} dc = null; }
+    if (pc) { try { pc.close(); } catch(e){} pc = null; }
+    if (sigWs) { try { sigWs.close(); } catch(e){} sigWs = null; }
+    setConnected(false);
+    offsets = [];
+    clockSynced = false;
+    logInfo('webrtc', 'Disconnected');
 }
 
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function disconnect() {
-    if (ws) { ws.close(); ws = null; }
-    stopSending();
-}
+// ============ ACK HANDLING ============
 
 function handleAck(buf) {
     const now_local = Date.now();
     const ack = decodeAck(buf);
-    
-    // Guard against decode failure
     if (!ack) return;
-    
+
     ackCount++;
-    lastAckTime = now_local;
-    
-    // Convert browser receive time to relay clock domain
-    // offset = relay_time - browser_time, so relay_time = browser_time + offset
-    const t6_relay = Math.floor(now_local + clockOffset);
-    
+
+    // RTT — pure browser clock, exact (no cross-clock correction needed)
+    const rtt = now_local - ack.t1_browser;
+
+    // Per-segment latency (requires clock sync for Python timestamps)
+    // clockOffset = python_time - browser_time
+    // so browser_time_of_python_event = python_event_time - clockOffset
+    const t3p_browser = ack.t3_python_rx - clockOffset;
+    const t4p_browser = ack.t4_python_ack - clockOffset;
+    const oneway_to_python   = t3p_browser - ack.t1_browser;
+    const python_processing  = (ack.decode_us + ack.process_us + ack.encode_us) / 1000;
+    const oneway_from_python = now_local - t4p_browser;
+
     const lat = {
-        browserToRelay: ack.t2_relay_rx - ack.t1_browser,
-        relayProc: ack.t3_relay_tx - ack.t2_relay_rx,
-        relayToPython: ack.t3_python_rx - ack.t3_relay_tx,
-        decode_us: ack.decode_us,
-        process_us: ack.process_us,
-        encode_us: ack.encode_us,
-        pythonMs: (ack.decode_us + ack.process_us + ack.encode_us) / 1000,
-        pythonToRelay: ack.t4_relay_ack_rx - ack.t4_python_ack,
-        relayAckProc: ack.t5_relay_ack_tx - ack.t4_relay_ack_rx,
-        relayToBrowser: t6_relay - ack.t5_relay_ack_tx,
-        returnPath: t6_relay - ack.t4_python_ack,
-        rtt: t6_relay - ack.t1_browser,
-        // Raw timestamps for display (all in relay time)
+        rtt,
+        toPython:    oneway_to_python,
+        pythonMs:    python_processing,
+        fromPython:  oneway_from_python,
+        decode_us:   ack.decode_us,
+        process_us:  ack.process_us,
+        encode_us:   ack.encode_us,
+        // For timestamp display
         t1: ack.t1_browser,
-        t2: ack.t2_relay_rx,
-        t3: ack.t3_relay_tx,
         t3py: ack.t3_python_rx,
         t4py: ack.t4_python_ack,
-        t4rel: ack.t4_relay_ack_rx,
-        t5rel: ack.t5_relay_ack_tx,
-        t6: t6_relay,
+        t6: now_local,
     };
-    
-    // ---- SANITY CHECKS ----
-    // These catch clock sync issues, protocol bugs, or stale data
-    
-    if (!clockSynced) {
-        logWarn('ack', `msg=${ack.msgId} received before clock sync complete — latency values may be inaccurate`);
+
+    if (rtt < 0) {
+        logError('ack', `Negative RTT=${rtt}ms — clock issue?`);
+    } else if (rtt > 5000) {
+        logWarn('ack', `High RTT=${rtt}ms`);
     }
-    
-    // RTT should be positive and reasonable (< 5 seconds)
-    if (lat.rtt < 0) {
-        logError('ack', `msg=${ack.msgId} NEGATIVE RTT=${lat.rtt}ms — clock offset wrong? offset=${clockOffset.toFixed(1)}ms`, {
-            t1_browser: ack.t1_browser,
-            t6_relay: t6_relay,
-            now_local: now_local,
-            clockOffset: clockOffset,
-        });
-    } else if (lat.rtt > 5000) {
-        logWarn('ack', `msg=${ack.msgId} HIGH RTT=${lat.rtt}ms — network issue or stale message?`);
+
+    if (!clockSynced && ackCount <= 3) {
+        logWarn('ack', `msg=${ack.msgId} before clock sync — segments may be inaccurate`);
     }
-    
-    // Each segment should be non-negative (within clock sync tolerance ~±5ms)
-    const segments = [
-        { name: 'browserToRelay', val: lat.browserToRelay },
-        { name: 'relayProc',      val: lat.relayProc },
-        { name: 'relayToPython',  val: lat.relayToPython },
-        { name: 'pythonToRelay',  val: lat.pythonToRelay },
-        { name: 'relayAckProc',   val: lat.relayAckProc },
-        { name: 'relayToBrowser', val: lat.relayToBrowser },
-    ];
-    
-    for (const seg of segments) {
-        if (seg.val < -10) {
-            logWarn('ack', `msg=${ack.msgId} NEGATIVE segment ${seg.name}=${seg.val.toFixed(1)}ms — clock sync drift?`);
-        }
-        if (Math.abs(seg.val) > 10000) {
-            logError('ack', `msg=${ack.msgId} HUGE segment ${seg.name}=${seg.val.toFixed(1)}ms — clock domain mismatch!`, {
-                clockOffset: clockOffset.toFixed(1),
-                clockSynced: clockSynced,
-            });
-        }
-    }
-    
-    // Check timestamp ordering: t1 < t2 < t3 < t3py < t4py < t4rel < t5rel < t6
-    const tsChain = [
-        { name: 't1→t2', a: ack.t1_browser,    b: ack.t2_relay_rx },
-        { name: 't2→t3', a: ack.t2_relay_rx,    b: ack.t3_relay_tx },
-        { name: 't3→t3py', a: ack.t3_relay_tx,  b: ack.t3_python_rx },
-        { name: 't3py→t4py', a: ack.t3_python_rx, b: ack.t4_python_ack },
-        { name: 't4py→t4rel', a: ack.t4_python_ack, b: ack.t4_relay_ack_rx },
-        { name: 't4rel→t5rel', a: ack.t4_relay_ack_rx, b: ack.t5_relay_ack_tx },
-        { name: 't5rel→t6', a: ack.t5_relay_ack_tx, b: t6_relay },
-    ];
-    
-    for (const ts of tsChain) {
-        if (ts.b < ts.a) {
-            logWarn('ack', `msg=${ack.msgId} TIMESTAMP ORDER VIOLATION ${ts.name}: ${ts.a} > ${ts.b} (diff=${ts.a - ts.b}ms)`);
-        }
-    }
-    
-    // Log first 5 acks in detail to help debug startup issues
+
     if (ackCount <= 5) {
-        logInfo('ack', `msg=${ack.msgId} [${ackCount}/5 startup] RTT=${lat.rtt.toFixed(1)}ms`, {
-            segments: {
-                'B→R': lat.browserToRelay.toFixed(1),
-                'R_proc': lat.relayProc.toFixed(1),
-                'R→Py': lat.relayToPython.toFixed(1),
-                'Py_ms': lat.pythonMs.toFixed(2),
-                'Py→R': lat.pythonToRelay.toFixed(1),
-                'R_ack': lat.relayAckProc.toFixed(1),
-                'R→B': lat.relayToBrowser.toFixed(1),
-            },
-            clock: {
-                offset: clockOffset.toFixed(1),
-                synced: clockSynced,
-            },
+        logInfo('ack', `msg=${ack.msgId} [${ackCount}/5 startup] RTT=${rtt.toFixed(1)}ms`, {
+            '→Python': oneway_to_python.toFixed(1) + 'ms',
+            'Python': python_processing.toFixed(2) + 'ms',
+            '←Python': oneway_from_python.toFixed(1) + 'ms',
         });
     }
-    
-    logDebug('ack', `msg=${ack.msgId} RTT=${lat.rtt.toFixed(1)}ms B→R=${lat.browserToRelay.toFixed(1)} R→Py=${lat.relayToPython.toFixed(1)} Py=${lat.pythonMs.toFixed(2)} Py→R=${lat.pythonToRelay.toFixed(1)} R→B=${lat.relayToBrowser.toFixed(1)}`);
-    
+
+    logDebug('ack', `msg=${ack.msgId} RTT=${rtt.toFixed(1)}ms →Py=${oneway_to_python.toFixed(1)} proc=${python_processing.toFixed(2)} ←Py=${oneway_from_python.toFixed(1)}`);
+
     updateMetrics(lat);
-    updateChart(lat, now_local);  // Use local time for chart x-axis
+    updateChart(lat, now_local);
     updateBreakdown(lat);
     updateTimestamps(lat);
 }
@@ -488,23 +517,26 @@ function handleAck(buf) {
 function handleSyncResp(buf) {
     const t4 = Date.now();
     const r = decodeSyncResp(buf);
-    
-    const rtt = (t4 - r.t1) - (r.t3 - r.t2);
+
+    const rtt    = (t4 - r.t1) - (r.t3 - r.t2);
     const offset = ((r.t2 - r.t1) + (r.t3 - t4)) / 2;
-    
+
     offsets.push(offset);
     if (offsets.length > 5) offsets.shift();
-    
-    const sorted = [...offsets].sort((a,b) => a-b);
-    clockOffset = sorted[Math.floor(sorted.length/2)];
-    clockRtt = rtt;
+
+    const sorted = [...offsets].sort((a, b) => a - b);
+    clockOffset = sorted[Math.floor(sorted.length / 2)];
+    clockRtt    = rtt;
     clockSynced = offsets.length >= 3;
-    
+
     logInfo('sync', `sample=${offsets.length} rtt=${rtt.toFixed(1)}ms offset=${offset.toFixed(1)}ms → median=${clockOffset.toFixed(1)}ms synced=${clockSynced}`);
-    
-    document.getElementById('syncOffset').textContent = clockOffset.toFixed(1) + ' ms';
-    document.getElementById('syncRtt').textContent = clockRtt.toFixed(1) + ' ms';
-    document.getElementById('syncStatus').textContent = clockSynced ? 'Synced ✓' : 'Syncing...';
+
+    const el_offset = document.getElementById('syncOffset');
+    const el_rtt    = document.getElementById('syncRtt');
+    const el_status = document.getElementById('syncStatus');
+    if (el_offset) el_offset.textContent = clockOffset.toFixed(1) + ' ms';
+    if (el_rtt)    el_rtt.textContent    = clockRtt.toFixed(1) + ' ms';
+    if (el_status) el_status.textContent = clockSynced ? 'Synced ✓' : 'Syncing...';
 }
 
 // ============ SENDING ============
@@ -517,37 +549,37 @@ function startSending() {
 
 function stopSending() {
     if (sendTimer) { clearInterval(sendTimer); sendTimer = null; }
-    logInfo('send', 'Stopped sending');
 }
 
 function sendTwist() {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!dc || dc.readyState !== 'open') return;
     msgId++;
+
+    // In P2P mode, t1 is plain Date.now() (browser clock).
+    // RTT = t6 - t1 will be in the same clock domain — no offset needed.
+    const t1 = Date.now();
     const velocities = { lx: 0, ly: linY, lz: 0, ax: 0, ay: 0, az: angZ };
-    
-    // Send t1 in RELAY time (local + offset) for accurate cross-clock latency
-    // offset = relay_time - browser_time, so relay_time = browser_time + offset
-    // FIX: Math.floor() to ensure integer for BigInt conversion
-    const now = Date.now();
-    const t1_relay = Math.floor(now + clockOffset);
-    
-    if (!clockSynced && msgId <= 3) {
-        logWarn('send', `msg=${msgId} sending before clock sync — t1_relay=${t1_relay} (offset=${clockOffset.toFixed(1)})`);
+    const buf = encodeTwist(msgId, t1, velocities);
+
+    try {
+        dc.send(buf);
+    } catch (e) {
+        logError('send', `DataChannel send error: ${e.message}`);
     }
-    
-    const buf = encodeTwist(msgId, t1_relay, velocities);
-    ws.send(buf);
-    
-    // Update size display
+
     const sizeEl = document.getElementById('msgSize');
     if (sizeEl) sizeEl.textContent = `${buf.byteLength}B`;
 }
 
 function sendSyncReq() {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!dc || dc.readyState !== 'open') return;
     const t1 = Date.now();
-    ws.send(encodeSyncReq(t1));
-    logDebug('sync', `sent req t1=${t1}`);
+    try {
+        dc.send(encodeSyncReq(t1));
+        logDebug('sync', `sent req t1=${t1}`);
+    } catch (e) {
+        logError('sync', `Send error: ${e.message}`);
+    }
 }
 
 function sendStop() {
@@ -562,7 +594,6 @@ function sendStop() {
 function setupKeyboard() {
     document.addEventListener('keydown', (e) => {
         if (e.target.tagName === 'INPUT') return;
-        
         const key = e.key.toLowerCase();
         if (['w', 's', 'a', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' '].includes(key)) {
             e.preventDefault();
@@ -570,99 +601,75 @@ function setupKeyboard() {
             updateFromKeys();
         }
     });
-    
+
     document.addEventListener('keyup', (e) => {
         const key = e.key.toLowerCase();
         keysPressed.delete(key);
         updateFromKeys();
     });
-    
-    // Continuous update while keys held
+
     keyTimer = setInterval(() => {
-        if (keysPressed.size > 0) {
-            updateFromKeys();
-        }
+        if (keysPressed.size > 0) updateFromKeys();
     }, CONFIG.keyRepeatMs);
 }
 
 function updateFromKeys() {
-    let newLinY = 0;
-    let newAngZ = 0;
-    
-    // Forward/backward (W/S or Up/Down)
-    if (keysPressed.has('w') || keysPressed.has('arrowup')) {
-        newLinY = currentSpeed;
-    } else if (keysPressed.has('s') || keysPressed.has('arrowdown')) {
-        newLinY = -currentSpeed;
-    }
-    
-    // Left/right rotation (A/D or Left/Right)
-    if (keysPressed.has('a') || keysPressed.has('arrowleft')) {
-        newAngZ = currentSpeed;
-    } else if (keysPressed.has('d') || keysPressed.has('arrowright')) {
-        newAngZ = -currentSpeed;
-    }
-    
-    // Space = stop
-    if (keysPressed.has(' ')) {
-        newLinY = 0;
-        newAngZ = 0;
-    }
-    
+    let newLinY = 0, newAngZ = 0;
+    if (keysPressed.has('w') || keysPressed.has('arrowup'))    newLinY =  currentSpeed;
+    if (keysPressed.has('s') || keysPressed.has('arrowdown'))  newLinY = -currentSpeed;
+    if (keysPressed.has('a') || keysPressed.has('arrowleft'))  newAngZ =  currentSpeed;
+    if (keysPressed.has('d') || keysPressed.has('arrowright')) newAngZ = -currentSpeed;
+    if (keysPressed.has(' ')) { newLinY = 0; newAngZ = 0; }
     linY = newLinY;
     angZ = newAngZ;
     updateControlDisplay();
 }
 
-// ============ JOYSTICK (optional) ============
+// ============ JOYSTICK ============
 
 function setupJoystick() {
     const container = document.getElementById('joystick');
     const knob = document.getElementById('knob');
     if (!container || !knob) return;
-    
+
     let dragging = false;
-    
+
     const update = (x, y) => {
         const rect = container.getBoundingClientRect();
         const cx = rect.width / 2, cy = rect.height / 2;
         const maxR = (rect.width - knob.offsetWidth) / 2;
-        
         let dx = x - cx, dy = y - cy;
         const dist = Math.hypot(dx, dy);
         if (dist > maxR) { dx = dx/dist*maxR; dy = dy/dist*maxR; }
-        
         knob.style.left = `${cx + dx}px`;
-        knob.style.top = `${cy + dy}px`;
-        
-        // Use currentSpeed for magnitude
+        knob.style.top  = `${cy + dy}px`;
         linY = -dy / maxR * currentSpeed;
         angZ = -dx / maxR * currentSpeed;
         updateControlDisplay();
     };
-    
+
     const onMove = (e) => {
         if (!dragging) return;
         e.preventDefault();
         const rect = container.getBoundingClientRect();
-        const clientX = e.clientX ?? (e.touches && e.touches[0] ? e.touches[0].clientX : rect.width/2);
-        const clientY = e.clientY ?? (e.touches && e.touches[0] ? e.touches[0].clientY : rect.height/2);
+        const clientX = e.clientX ?? (e.touches?.[0]?.clientX ?? rect.width/2);
+        const clientY = e.clientY ?? (e.touches?.[0]?.clientY ?? rect.height/2);
         update(clientX - rect.left, clientY - rect.top);
     };
-    
+
     const onEnd = () => {
         dragging = false;
         knob.style.left = '50%';
-        knob.style.top = '50%';
+        knob.style.top  = '50%';
         linY = 0; angZ = 0;
         updateControlDisplay();
     };
-    
-    knob.addEventListener('mousedown', () => dragging = true);
+
+    knob.addEventListener('mousedown',  () => dragging = true);
     knob.addEventListener('touchstart', () => dragging = true);
     document.addEventListener('mousemove', onMove);
     document.addEventListener('touchmove', onMove, { passive: false });
-    document.addEventListener('mouseup', onEnd);
+    document.addEventListener('mouseup',  onEnd);
     document.addEventListener('touchend', onEnd);
 }
 
@@ -670,13 +677,12 @@ function setupJoystick() {
 
 function setConnected(v) {
     connected = v;
-    const dot = document.getElementById('statusDot');
+    const dot  = document.getElementById('statusDot');
     const text = document.getElementById('statusText');
-    const btn = document.getElementById('connectBtn');
-    
-    if (dot) dot.classList.toggle('on', v);
-    if (text) text.textContent = v ? 'Connected' : 'Disconnected';
-    if (btn) btn.textContent = v ? 'Disconnect' : 'Connect';
+    const btn  = document.getElementById('connectBtn');
+    if (dot)  dot.classList.toggle('on', v);
+    if (text) text.textContent = v ? 'Connected (P2P)' : 'Disconnected';
+    if (btn)  btn.textContent  = v ? 'Disconnect' : 'Connect';
 }
 
 function updateControlDisplay() {
@@ -684,18 +690,15 @@ function updateControlDisplay() {
     const angEl = document.getElementById('angZ');
     if (linEl) linEl.textContent = linY.toFixed(2);
     if (angEl) angEl.textContent = angZ.toFixed(2);
-    
-    // Update key indicators
     updateKeyIndicators();
 }
 
 function updateKeyIndicators() {
-    const keys = ['w', 'a', 's', 'd'];
-    keys.forEach(k => {
+    ['w','a','s','d'].forEach(k => {
         const el = document.getElementById(`key-${k}`);
         if (el) {
-            const altKey = k === 'w' ? 'arrowup' : k === 's' ? 'arrowdown' : k === 'a' ? 'arrowleft' : 'arrowright';
-            el.classList.toggle('active', keysPressed.has(k) || keysPressed.has(altKey));
+            const alt = k==='w'?'arrowup':k==='s'?'arrowdown':k==='a'?'arrowleft':'arrowright';
+            el.classList.toggle('active', keysPressed.has(k) || keysPressed.has(alt));
         }
     });
 }
@@ -703,51 +706,43 @@ function updateKeyIndicators() {
 function updateMetrics(lat) {
     const set = (id, val) => {
         const el = document.getElementById(id);
-        if (el && val !== undefined && val !== null && !isNaN(val)) {
+        if (el && val !== undefined && !isNaN(val)) {
             el.innerHTML = val.toFixed(1) + '<span class="metric-unit">ms</span>';
         }
     };
     set('mRtt', lat.rtt);
-    set('mBR', lat.browserToRelay);
-    set('mRP', lat.relayToPython);
-    set('mPy', lat.pythonMs);
-    set('mPR', lat.pythonToRelay);
-    set('mRB', lat.relayToBrowser);
+    set('mBR',  lat.toPython);
+    set('mPy',  lat.pythonMs);
+    set('mPR',  lat.fromPython);
 }
 
 function updateChart(lat, now) {
     if (!chart) return;
-    
     const cutoff = now - CONFIG.chartWindowSec * 1000;
     history.push({ time: now, ...lat });
     history = history.filter(d => d.time > cutoff);
-    
+
     chart.data.labels = history.map(d => `-${((now - d.time)/1000).toFixed(1)}s`);
     chart.data.datasets[0].data = history.map(d => d.rtt);
-    chart.data.datasets[1].data = history.map(d => d.browserToRelay);
-    chart.data.datasets[2].data = history.map(d => d.relayToPython);
-    chart.data.datasets[3].data = history.map(d => d.pythonMs);
-    chart.data.datasets[4].data = history.map(d => d.returnPath);
+    chart.data.datasets[1].data = history.map(d => d.toPython);
+    chart.data.datasets[2].data = history.map(d => d.pythonMs);
+    chart.data.datasets[3].data = history.map(d => d.fromPython);
     chart.update('none');
 }
 
 function updateBreakdown(lat) {
     const el = document.getElementById('breakdown');
     if (!el) return;
-    
+
     const items = [
-        { label: 'Browser → Relay', color: '#f72585', val: lat.browserToRelay, unit: 'ms' },
-        { label: 'Relay Forward', color: '#9b5de5', val: lat.relayProc, unit: 'ms' },
-        { label: 'Relay → Python', color: '#fee440', val: lat.relayToPython, unit: 'ms' },
-        { label: 'Python Decode', color: '#4361ee', val: lat.decode_us, unit: 'μs' },
-        { label: 'Python Process', color: '#4361ee', val: lat.process_us, unit: 'μs' },
-        { label: 'Python Encode', color: '#4361ee', val: lat.encode_us, unit: 'μs' },
-        { label: 'Python → Relay', color: '#ff6b35', val: lat.pythonToRelay, unit: 'ms' },
-        { label: 'Relay Ack Fwd', color: '#9b5de5', val: lat.relayAckProc, unit: 'ms' },
-        { label: 'Relay → Browser', color: '#ff6b35', val: lat.relayToBrowser, unit: 'ms' },
-        { label: 'Total RTT', color: '#00f5d4', val: lat.rtt, unit: 'ms' },
+        { label: 'Browser → Python',  color: '#f72585', val: lat.toPython,   unit: 'ms' },
+        { label: 'Python Decode',      color: '#4361ee', val: lat.decode_us,  unit: 'μs' },
+        { label: 'Python Process',     color: '#4361ee', val: lat.process_us, unit: 'μs' },
+        { label: 'Python Encode',      color: '#4361ee', val: lat.encode_us,  unit: 'μs' },
+        { label: 'Python → Browser',   color: '#ff6b35', val: lat.fromPython, unit: 'ms' },
+        { label: 'Total RTT',          color: '#00f5d4', val: lat.rtt,        unit: 'ms' },
     ];
-    
+
     el.innerHTML = items.map(i => `
         <div class="breakdown-item">
             <div class="breakdown-label">
@@ -755,7 +750,7 @@ function updateBreakdown(lat) {
                 ${i.label}
             </div>
             <div class="breakdown-val" style="color:${i.color}">
-                ${(i.val !== undefined && i.val !== null && !isNaN(i.val)) ? i.val.toFixed(i.unit === 'μs' ? 0 : 2) : '--'} ${i.unit}
+                ${(i.val !== undefined && !isNaN(i.val)) ? i.val.toFixed(i.unit === 'μs' ? 0 : 2) : '--'} ${i.unit}
             </div>
         </div>
     `).join('');
@@ -764,46 +759,35 @@ function updateBreakdown(lat) {
 function updateTimestamps(lat) {
     const el = document.getElementById('timestamps');
     if (!el) return;
-    
-    const formatTs = (ts) => {
-        if (!ts) return '--';
-        const d = new Date(ts);
-        return d.toISOString().substr(11, 12); // HH:MM:SS.mmm
-    };
-    
+
+    const fmt = (ts) => ts ? new Date(ts).toISOString().substr(11, 12) : '--';
+
     el.innerHTML = `
-        <div class="ts-row"><span class="ts-label">t1 Browser Send</span><span class="ts-val">${formatTs(lat.t1)}</span></div>
-        <div class="ts-row"><span class="ts-label">t2 Relay Rx</span><span class="ts-val">${formatTs(lat.t2)}</span></div>
-        <div class="ts-row"><span class="ts-label">t3 Relay Tx</span><span class="ts-val">${formatTs(lat.t3)}</span></div>
-        <div class="ts-row"><span class="ts-label">t3 Python Rx</span><span class="ts-val">${formatTs(lat.t3py)}</span></div>
-        <div class="ts-row"><span class="ts-label">t4 Python Ack</span><span class="ts-val">${formatTs(lat.t4py)}</span></div>
-        <div class="ts-row"><span class="ts-label">t4 Relay Ack Rx</span><span class="ts-val">${formatTs(lat.t4rel)}</span></div>
-        <div class="ts-row"><span class="ts-label">t5 Relay Ack Tx</span><span class="ts-val">${formatTs(lat.t5rel)}</span></div>
-        <div class="ts-row"><span class="ts-label">t6 Browser Rx</span><span class="ts-val">${formatTs(lat.t6)}</span></div>
+        <div class="ts-row"><span class="ts-label">t1 Browser Send</span><span class="ts-val">${fmt(lat.t1)}</span></div>
+        <div class="ts-row"><span class="ts-label">t3 Python Rx</span><span class="ts-val">${fmt(lat.t3py)}</span></div>
+        <div class="ts-row"><span class="ts-label">t4 Python Ack</span><span class="ts-val">${fmt(lat.t4py)}</span></div>
+        <div class="ts-row"><span class="ts-label">t6 Browser Rx</span><span class="ts-val">${fmt(lat.t6)}</span></div>
+        <div class="ts-row"><span class="ts-label">Clock Offset (P2P)</span><span class="ts-val">${clockOffset.toFixed(1)} ms</span></div>
     `;
 }
 
 // ============ SPEED CONTROL ============
 
 function setupSpeedControl() {
-    const slider = document.getElementById('speedSlider');
+    const slider  = document.getElementById('speedSlider');
     const display = document.getElementById('speedValue');
-    
     if (!slider || !display) return;
-    
-    slider.min = CONFIG.minSpeed;
-    slider.max = CONFIG.maxSpeed;
-    slider.step = 0.5;
+
+    slider.min   = CONFIG.minSpeed;
+    slider.max   = CONFIG.maxSpeed;
+    slider.step  = 0.5;
     slider.value = CONFIG.defaultSpeed;
     display.textContent = CONFIG.defaultSpeed.toFixed(1);
-    
+
     slider.addEventListener('input', (e) => {
         currentSpeed = parseFloat(e.target.value);
         display.textContent = currentSpeed.toFixed(1);
-        
-        if (keysPressed.size > 0) {
-            updateFromKeys();
-        }
+        if (keysPressed.size > 0) updateFromKeys();
     });
 }
 
@@ -812,7 +796,7 @@ function setupSpeedControl() {
 function setupFieldSelector() {
     const container = document.getElementById('fieldSelector');
     if (!container) return;
-    
+
     container.innerHTML = FIELD_ORDER.map(f => {
         const checked = (fieldMask & f.bit) ? 'checked' : '';
         return `
@@ -822,31 +806,26 @@ function setupFieldSelector() {
                 <span class="field-bit">0x${f.bit.toString(16).padStart(2,'0')}</span>
             </label>`;
     }).join('');
-    
+
     container.addEventListener('change', (e) => {
         if (e.target.type !== 'checkbox') return;
         const bit = parseInt(e.target.dataset.bit);
-        if (e.target.checked) {
-            fieldMask |= bit;
-        } else {
-            fieldMask &= ~bit;
-        }
+        if (e.target.checked) fieldMask |= bit;
+        else                  fieldMask &= ~bit;
         updateFieldInfo();
     });
-    
+
     updateFieldInfo();
 }
 
 function updateFieldInfo() {
-    const maskEl = document.getElementById('fieldMask');
-    const sizeEl = document.getElementById('msgSize');
+    const maskEl  = document.getElementById('fieldMask');
+    const sizeEl  = document.getElementById('msgSize');
     const countEl = document.getElementById('fieldCount');
-    
     const n = popcount(fieldMask);
     const size = 18 + n * 8;
-    
-    if (maskEl) maskEl.textContent = `0x${fieldMask.toString(16).padStart(2, '0')}`;
-    if (sizeEl) sizeEl.textContent = `${size}B`;
+    if (maskEl)  maskEl.textContent  = `0x${fieldMask.toString(16).padStart(2, '0')}`;
+    if (sizeEl)  sizeEl.textContent  = `${size}B`;
     if (countEl) countEl.textContent = `${n}/6`;
 }
 
@@ -858,27 +837,23 @@ function init() {
     setupJoystick();
     setupSpeedControl();
     setupFieldSelector();
-    
-    // Button handlers
+
     const connectBtn = document.getElementById('connectBtn');
-    const stopBtn = document.getElementById('stopBtn');
-    const syncBtn = document.getElementById('syncBtn');
-    
+    const stopBtn    = document.getElementById('stopBtn');
+    const syncBtn    = document.getElementById('syncBtn');
+
     if (connectBtn) connectBtn.onclick = () => connected ? disconnect() : connect();
-    if (stopBtn) stopBtn.onclick = sendStop;
-    if (syncBtn) syncBtn.onclick = sendSyncReq;
-    
-    // Initialize breakdown with empty state
+    if (stopBtn)    stopBtn.onclick    = sendStop;
+    if (syncBtn)    syncBtn.onclick    = sendSyncReq;
+
     updateBreakdown({});
-    
-    logInfo('init', 'Teleop Dashboard initialized');
+
+    logInfo('init', 'Teleop Dashboard (WebRTC P2P) initialized');
+    logInfo('init', 'Transport: RTCDataChannel (signaling via Go WS, data direct P2P)');
     logInfo('init', 'Controls: WASD or Arrow Keys, Space to stop');
-    logInfo('init', `Speed range: ${CONFIG.minSpeed} - ${CONFIG.maxSpeed}`);
-    logInfo('init', `Field mask: 0x${fieldMask.toString(16)} (${popcount(fieldMask)} fields, ${18 + popcount(fieldMask)*8} bytes)`);
-    logInfo('init', `Debug logging: ${CONFIG.debugLog ? 'ON' : 'OFF'} — set CONFIG.debugLog=true in console for verbose output`);
+    logInfo('init', `Debug logging: ${CONFIG.debugLog ? 'ON' : 'OFF'} — set CONFIG.debugLog=true in console`);
 }
 
-// Start when DOM ready
 if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
 } else {

@@ -106,7 +106,7 @@
         
         .metrics {
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
+            grid-template-columns: repeat(4, 1fr);
             gap: 8px;
             margin-top: 16px;
         }
@@ -460,11 +460,9 @@
                         <div class="chart-wrap"><canvas id="chart"></canvas></div>
                         <div class="metrics">
                             <div class="metric"><div class="metric-label">Total RTT</div><div class="metric-val" id="mRtt">--<span class="metric-unit">ms</span></div></div>
-                            <div class="metric m"><div class="metric-label">Browser→Relay</div><div class="metric-val" id="mBR">--<span class="metric-unit">ms</span></div></div>
-                            <div class="metric y"><div class="metric-label">Relay→Python</div><div class="metric-val" id="mRP">--<span class="metric-unit">ms</span></div></div>
+                            <div class="metric m"><div class="metric-label">Browser→Python</div><div class="metric-val" id="mBR">--<span class="metric-unit">ms</span></div></div>
                             <div class="metric b"><div class="metric-label">Python Proc</div><div class="metric-val" id="mPy">--<span class="metric-unit">ms</span></div></div>
-                            <div class="metric o"><div class="metric-label">Python→Relay</div><div class="metric-val" id="mPR">--<span class="metric-unit">ms</span></div></div>
-                            <div class="metric p"><div class="metric-label">Relay→Browser</div><div class="metric-val" id="mRB">--<span class="metric-unit">ms</span></div></div>
+                            <div class="metric o"><div class="metric-label">Python→Browser</div><div class="metric-val" id="mPR">--<span class="metric-unit">ms</span></div></div>
                         </div>
                     </div>
                 </div>
@@ -533,7 +531,7 @@
                 </div>
                 
                 <div class="panel" style="margin-top:16px">
-                    <div class="panel-header">Clock Sync (Browser ↔ Relay)</div>
+                    <div class="panel-header">Clock Sync (Browser ↔ Python)</div>
                     <div class="panel-body">
                         <div class="sync-info">
                             <div class="sync-row"><span class="sync-label">Offset</span><span class="sync-val" id="syncOffset">--</span></div>
@@ -541,7 +539,7 @@
                             <div class="sync-row"><span class="sync-label">Status</span><span class="sync-val" id="syncStatus">--</span></div>
                         </div>
                         <button class="btn btn-secondary" id="syncBtn">Force Sync</button>
-                        <div class="sync-note">All timestamps in Relay Time</div>
+                        <div class="sync-note">Offset: Python clock − Browser clock</div>
                     </div>
                 </div>
                 
@@ -567,7 +565,7 @@
                         <div class="proto-info">
                             <div>Binary Protocol:</div>
                             <div><code>0x01</code> Twist (18 + 8×N B)</div>
-                            <div><code>0x02</code> Ack (69B → 77B)</div>
+                            <div><code>0x02</code> P2P Ack (45B)</div>
                             <div><code>0x03</code> SyncReq (9B)</div>
                             <div><code>0x04</code> SyncResp (25B)</div>
                         </div>
