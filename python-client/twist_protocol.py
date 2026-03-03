@@ -27,13 +27,7 @@ TWIST MESSAGE FORMAT (variable size):
     bit 4 (0x10) = angular_y
     bit 5 (0x20) = angular_z
 
-  Examples:
-    mask=0x22 (linear_y + angular_z): 18 + 16 = 34 bytes (50 with relay)
-    mask=0x3F (all fields):           18 + 48 = 66 bytes (82 with relay)
 
-Performance:
-    - Encoding: ~1μs
-    - Decoding: ~1μs
 """
 
 import struct
@@ -83,6 +77,25 @@ CLOCK_SYNC_RESPONSE_SIZE = 25
 # Legacy constants (kept for backward compatibility checks)
 TWIST_BROWSER_SIZE = 65     # Old fixed format: type + msg_id + t1 + 6×float64
 TWIST_RELAY_SIZE = 81       # Old fixed format with relay timestamps
+
+# ---- P2P Ack (no relay timestamps) ----
+# Used when Python↔Browser communicate via WebRTC DataChannel (no Go relay).
+#
+# Binary layout (45 bytes):
+#   [0]     uint8   type (0x02)
+#   [1-8]   uint64  message_id
+#   [9-16]  uint64  t1_browser_send
+#   [17-24] uint64  t3_python_rx      (Python receive time, Python clock)
+#   [25-32] uint64  t4_python_ack     (Python ack time,     Python clock)
+#   [33-36] uint32  python_decode_us
+#   [37-40] uint32  python_process_us
+#   [41-44] uint32  python_encode_us
+#
+# The browser computes RTT = t6_browser_rx - t1_browser_send (same clock domain).
+# ClockSync (0x03/0x04) is now answered by Python directly, giving the browser a
+# clock offset to compare Python timestamps if desired.
+P2P_TWIST_ACK_FORMAT = '<BQ3Q3I'
+P2P_TWIST_ACK_SIZE = 45    # 1 + 8 + 8+8+8 + 4+4+4 = 45
 
 
 # =============================================================================
@@ -286,7 +299,7 @@ class TwistAck:
     timestamps: LatencyTimestamps
 
     def encode(self) -> bytes:
-        """Encode to binary (69 bytes)."""
+        """Encode to binary (69 bytes) — relay mode (includes relay timestamp slots)."""
         ts = self.timestamps
         return struct.pack(
             TWIST_ACK_PYTHON_FORMAT,
@@ -302,6 +315,53 @@ class TwistAck:
             ts.python_encode_us,       # I: encode duration (μs)
             0,                         # Q: reserved for t4_relay_ack_rx
         )
+
+    def encode_p2p(self) -> bytes:
+        """Encode to P2P binary format (45 bytes) — no relay timestamp slots.
+
+        Used when the DataChannel connects Python↔Browser directly.
+        Layout:
+          [0]     uint8   type (0x02)
+          [1-8]   uint64  message_id
+          [9-16]  uint64  t1_browser_send
+          [17-24] uint64  t3_python_rx
+          [25-32] uint64  t4_python_ack
+          [33-36] uint32  python_decode_us
+          [37-40] uint32  python_process_us
+          [41-44] uint32  python_encode_us
+        """
+        ts = self.timestamps
+        return struct.pack(
+            P2P_TWIST_ACK_FORMAT,
+            MessageType.TWIST_ACK,
+            self.message_id,
+            ts.t1_browser_send,
+            ts.t3_python_rx,
+            ts.t4_python_ack,
+            ts.python_decode_us,
+            ts.python_process_us,
+            ts.python_encode_us,
+        )
+
+    @classmethod
+    def decode_p2p(cls, data: bytes) -> 'TwistAck':
+        """Decode from P2P binary format (45 bytes)."""
+        if len(data) < P2P_TWIST_ACK_SIZE:
+            raise ValueError(f"P2P ack too short: {len(data)} < {P2P_TWIST_ACK_SIZE}")
+        if data[0] != MessageType.TWIST_ACK:
+            raise ValueError(f"Expected TWIST_ACK (0x02), got 0x{data[0]:02x}")
+
+        values = struct.unpack(P2P_TWIST_ACK_FORMAT, data[:P2P_TWIST_ACK_SIZE])
+        # values: [type, msg_id, t1, t3_py, t4_py, dec_us, proc_us, enc_us]
+        timestamps = LatencyTimestamps(
+            t1_browser_send=values[2],
+            t3_python_rx=values[3],
+            t4_python_ack=values[4],
+            python_decode_us=values[5],
+            python_process_us=values[6],
+            python_encode_us=values[7],
+        )
+        return cls(message_id=values[1], timestamps=timestamps)
 
     @classmethod
     def decode(cls, data: bytes) -> 'TwistAck':
