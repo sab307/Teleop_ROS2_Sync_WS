@@ -103,6 +103,28 @@ const CONFIG = {
     debugLog: false,
 };
 
+// ============ HIGH-RESOLUTION CLOCK ============
+/**
+ * now() — returns milliseconds since Unix epoch with sub-ms precision.
+ *
+ * WHY NOT Date.now():
+ *   Date.now() has 1ms resolution and is a wall-clock that can be adjusted
+ *   by NTP or the OS at any time.  More critically, it is read *after* the
+ *   JS event loop schedules the callback, so a GC pause or rendering frame
+ *   adds its full delay to the reading.
+ *
+ *   performance.now() is a monotonic clock with 0.1μs resolution.
+ *   It cannot jump backwards and is immune to NTP adjustments.
+ *
+ *   performance.timeOrigin is the Unix-epoch ms at which performance.now()
+ *   started, so their sum is directly comparable to Python's time.time()*1000.
+ *
+ * Unit: milliseconds (float). All existing arithmetic is unchanged.
+ */
+function now() {
+    return performance.timeOrigin + performance.now();
+}
+
 // ============ STATE ============
 // Signaling WebSocket (Go server — ephemeral, stays connected for ICE)
 let sigWs = null;
@@ -150,8 +172,7 @@ function logError(cat, msg, data) {
 /**
  * Encode Twist message (variable size: 18 + 8×N bytes).
  *
- * In P2P mode t1 is just Date.now() — no relay clock offset needed.
- * RTT = t6_receive - t1_send is measured entirely in browser time.
+ * In P2P mode t1 = now() (sub-ms monotonic). RTT = t6 - t1 in same clock domain.
  */
 function encodeTwist(id, t1, velocities) {
     const numFields = popcount(fieldMask);
@@ -238,6 +259,11 @@ function decodeSyncResp(buf) {
 // ============ CHART STATE ============
 // uPlot instance
 let uplot = null;
+
+// autoScroll = true  → chart advances with incoming data (live mode).
+// autoScroll = false → user has zoomed/panned; chart stays at that view.
+// Reset Zoom button sets it back to true.
+let autoScroll = true;
 
 // Columnar data arrays — uPlot's native format.
 // uData[0] = timestamps in seconds (x-axis)
@@ -381,6 +407,14 @@ function initChart() {
         // uPlot's built-in legend updates every series value live as the cursor
         // moves — this is the "per-ms resolution" inspection capability.
         legend: { show: true, live: true },
+
+        // ── Hooks ───────────────────────────────────────────────────────────
+        // setSelect fires when the user commits a drag-to-zoom selection.
+        // We use it to detect that the user has manually set a view so we
+        // can pause auto-scrolling until they click Reset Zoom.
+        hooks: {
+            setSelect: [() => { autoScroll = false; }],
+        },
     };
 
     uplot = new uPlot(opts, uData, wrap);
@@ -392,6 +426,9 @@ function initChart() {
     wrap.addEventListener('wheel', e => {
         e.preventDefault();
         if (!uplot) return;
+
+        // User is manually zooming — leave live-scroll mode
+        autoScroll = false;
 
         const xMin = uplot.scales.x.min;
         const xMax = uplot.scales.x.max;
@@ -421,13 +458,16 @@ function initChart() {
     }).observe(wrap);
 }
 
-/** resetZoom() — restores the full rolling window view after the user has
- *  zoomed or panned. Called by the "Reset Zoom" button. */
+/** resetZoom() — restores live-scroll mode and snaps the view to the most
+ *  recent chartWindowSec seconds. Called by the "Reset Zoom" button. */
 function resetZoom() {
+    autoScroll = true;
     if (!uplot || !uData[0].length) return;
-    const latest  = uData[0][uData[0].length - 1];
-    const earliest = uData[0][0];
-    uplot.setScale('x', { min: earliest, max: latest });
+    const latest = uData[0][uData[0].length - 1];
+    uplot.setScale('x', {
+        min: latest - CONFIG.chartWindowSec,
+        max: latest,
+    });
 }
 
 // ============ WEBRTC SIGNALING + CONNECTION ============
@@ -619,14 +659,16 @@ function sleep(ms) {
 // ============ ACK HANDLING ============
 
 function handleAck(buf) {
-    const now_local = Date.now();
+    // Capture t6 as the very first line — sub-ms monotonic clock.
+    // Any code before this (decode, variable init) would add artificial latency.
+    const t6 = now();
     const ack = decodeAck(buf);
     if (!ack) return;
 
     ackCount++;
 
     // RTT — pure browser clock, exact (no cross-clock correction needed)
-    const rtt = now_local - ack.t1_browser;
+    const rtt = t6 - ack.t1_browser;
 
     // Per-segment latency (requires clock sync for Python timestamps)
     // clockOffset = python_time - browser_time
@@ -635,7 +677,7 @@ function handleAck(buf) {
     const t4p_browser = ack.t4_python_ack - clockOffset;
     const oneway_to_python   = t3p_browser - ack.t1_browser;
     const python_processing  = (ack.decode_us + ack.process_us + ack.encode_us) / 1000;
-    const oneway_from_python = now_local - t4p_browser;
+    const oneway_from_python = t6 - t4p_browser;
 
     const lat = {
         rtt,
@@ -649,7 +691,7 @@ function handleAck(buf) {
         t1: ack.t1_browser,
         t3py: ack.t3_python_rx,
         t4py: ack.t4_python_ack,
-        t6: now_local,
+        t6,
     };
 
     if (rtt < 0) {
@@ -673,33 +715,69 @@ function handleAck(buf) {
     logDebug('ack', `msg=${ack.msgId} RTT=${rtt.toFixed(1)}ms →Py=${oneway_to_python.toFixed(1)} proc=${python_processing.toFixed(2)} ←Py=${oneway_from_python.toFixed(1)}`);
 
     updateMetrics(lat);
-    updateChart(lat, now_local);
+    updateChart(lat, t6);
     updateBreakdown(lat);
     updateTimestamps(lat);
 }
 
 function handleSyncResp(buf) {
-    const t4 = Date.now();
+    // Capture t4 with the same high-res clock used for t1 in sendSyncReq
+    const t4 = now();
     const r = decodeSyncResp(buf);
 
-    const rtt    = (t4 - r.t1) - (r.t3 - r.t2);
-    const offset = ((r.t2 - r.t1) + (r.t3 - t4)) / 2;
+    // NTP offset formula: clockOffset = python_time - browser_time
+    const syncRtt    = (t4 - r.t1) - (r.t3 - r.t2);
+    const rawOffset  = ((r.t2 - r.t1) + (r.t3 - t4)) / 2;
 
-    offsets.push(offset);
-    if (offsets.length > 5) offsets.shift();
+    // ── Outlier rejection ────────────────────────────────────────────────────
+    // A sync sample taken during a GC pause or high-load moment will have an
+    // inflated RTT. We reject samples whose RTT is more than 3× the median
+    // RTT of the existing window — these would corrupt the offset estimate.
+    // On the first 3 samples we accept everything to bootstrap the estimate.
+    if (offsets.length >= 3) {
+        const rtts  = offsets.map(o => o._rtt).filter(Boolean);
+        const medRtt = rtts.sort((a,b) => a-b)[Math.floor(rtts.length/2)];
+        if (syncRtt > medRtt * 3) {
+            logWarn('sync', `rejected outlier: syncRtt=${syncRtt.toFixed(1)}ms > 3× median ${medRtt.toFixed(1)}ms`);
+            return;
+        }
+    }
 
-    const sorted = [...offsets].sort((a, b) => a - b);
-    clockOffset = sorted[Math.floor(sorted.length / 2)];
-    clockRtt    = rtt;
+    // Store {value, _rtt} so we can use rtt for future outlier detection
+    offsets.push({ value: rawOffset, _rtt: syncRtt });
+    if (offsets.length > 10) offsets.shift();   // larger window = more stable
+
+    // Median of recent samples
+    const sorted     = [...offsets].map(o => o.value).sort((a, b) => a - b);
+    const newMedian  = sorted[Math.floor(sorted.length / 2)];
+
+    // ── Smooth offset transitions ────────────────────────────────────────────
+    // Instead of jumping to the new median instantly (which causes toPython
+    // and fromPython to spike in opposite directions), we ease toward it at
+    // 20% per sample. At 10s intervals this converges in ~5 syncs (50s).
+    // For the first sync we accept immediately to avoid initial bad readings.
+    const delta = newMedian - clockOffset;
+    if (!clockSynced) {
+        clockOffset = newMedian;   // bootstrap: accept first sync immediately
+    } else if (Math.abs(delta) > 50) {
+        // Large jump (>50ms) usually means Python restarted — accept hard reset
+        logWarn('sync', `large offset jump ${delta.toFixed(1)}ms — hard reset`);
+        clockOffset = newMedian;
+    } else {
+        // Gradual 20% blend — eliminates the periodic 10-30ms spike artifact
+        clockOffset = clockOffset + delta * 0.2;
+    }
+
+    clockRtt    = syncRtt;
     clockSynced = offsets.length >= 3;
 
-    logInfo('sync', `sample=${offsets.length} rtt=${rtt.toFixed(1)}ms offset=${offset.toFixed(1)}ms → median=${clockOffset.toFixed(1)}ms synced=${clockSynced}`);
+    logInfo('sync', `sample=${offsets.length} syncRtt=${syncRtt.toFixed(2)}ms raw=${rawOffset.toFixed(2)}ms median=${newMedian.toFixed(2)}ms → smooth=${clockOffset.toFixed(2)}ms`);
 
     const el_offset = document.getElementById('syncOffset');
     const el_rtt    = document.getElementById('syncRtt');
     const el_status = document.getElementById('syncStatus');
-    if (el_offset) el_offset.textContent = clockOffset.toFixed(1) + ' ms';
-    if (el_rtt)    el_rtt.textContent    = clockRtt.toFixed(1) + ' ms';
+    if (el_offset) el_offset.textContent = clockOffset.toFixed(2) + ' ms';
+    if (el_rtt)    el_rtt.textContent    = clockRtt.toFixed(2)   + ' ms';
     if (el_status) el_status.textContent = clockSynced ? 'Synced ✓' : 'Syncing...';
 }
 
@@ -719,9 +797,8 @@ function sendTwist() {
     if (!dc || dc.readyState !== 'open') return;
     msgId++;
 
-    // In P2P mode, t1 is plain Date.now() (browser clock).
-    // RTT = t6 - t1 will be in the same clock domain — no offset needed.
-    const t1 = Date.now();
+    // t1: sub-ms monotonic clock — must match now() used for t6 in handleAck.
+    const t1 = now();
     const velocities = { lx: 0, ly: linY, lz: 0, ax: 0, ay: 0, az: angZ };
     const buf = encodeTwist(msgId, t1, velocities);
 
@@ -737,7 +814,7 @@ function sendTwist() {
 
 function sendSyncReq() {
     if (!dc || dc.readyState !== 'open') return;
-    const t1 = Date.now();
+    const t1 = now();   // must match now() in handleSyncResp for accurate offset
     try {
         dc.send(encodeSyncReq(t1));
         logDebug('sync', `sent req t1=${t1}`);
@@ -880,22 +957,21 @@ function updateMetrics(lat) {
     set('mPR',  lat.fromPython);
 }
 
-function updateChart(lat, now) {
+function updateChart(lat, nowMs) {
     if (!uplot) return;
 
-    // uPlot x-axis uses seconds, not milliseconds
-    const t = now / 1000;
+    // uPlot x-axis is in seconds
+    const t = nowMs / 1000;
     const cutoff = t - CONFIG.chartWindowSec;
 
-    // Append new point to each column
+    // Append new columnar point
     uData[0].push(t);
     uData[1].push(lat.rtt);
     uData[2].push(lat.toPython);
     uData[3].push(lat.pythonMs);
     uData[4].push(lat.fromPython);
 
-    // Trim points older than the rolling window from the front.
-    // We find the first index still within the window and slice all columns.
+    // Trim points that have scrolled out of the rolling window from the front
     let start = 0;
     while (start < uData[0].length && uData[0][start] < cutoff) start++;
     if (start > 0) {
@@ -906,10 +982,19 @@ function updateChart(lat, now) {
         uData[4] = uData[4].slice(start);
     }
 
-    // Push columnar data to uPlot.
-    // setData(data, resetScales=false) redraws without touching the zoom state,
-    // so a user mid-zoom won't have their view snapped back on every ack.
-    uplot.setData(uData, false);
+    if (autoScroll) {
+        // LIVE MODE — advance the x-axis window so the chart scrolls in
+        // real-time exactly like Chart.js did.  We call setData WITH a new
+        // scale range so the view follows the latest data automatically.
+        // This replaces the old chart.update('none') call.
+        uplot.setData(uData, false);
+        uplot.setScale('x', { min: cutoff, max: t });
+    } else {
+        // ZOOMED/PAUSED MODE — push new data in but don't move the view.
+        // The user is inspecting a specific time window; let them stay there.
+        // New data accumulates and becomes visible if they pan right or reset.
+        uplot.setData(uData, false);
+    }
 }
 
 function updateBreakdown(lat) {
