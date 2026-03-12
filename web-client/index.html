@@ -4,8 +4,6 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Teleop Latency Dashboard</title>
-    <!-- uPlot: lightweight, high-performance time-series chart with built-in
-         cursor crosshair, scroll-wheel zoom, drag-to-zoom, and per-ms tooltip -->
     <link  rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
     <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
     <style>
@@ -105,7 +103,43 @@
         }
         .panel-body { padding: 16px; }
         
-        .chart-wrap { height: 260px; overflow: hidden; }
+        /* ── Chart wrapper
+           overflow: visible so the fixed-position tooltip is not clipped.
+           Height is enforced by uPlot's own canvas, not by overflow:hidden.   */
+        .chart-wrap {
+            height: 260px;
+            position: relative;
+            overflow: visible;
+        }
+
+        /* ── Idle / Active status badge shown below the chart header ──────── */
+        .chart-state-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 2px 9px;
+            border-radius: 10px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 0.3px;
+            transition: background 0.3s, color 0.3s;
+        }
+        .chart-state-badge.idle {
+            background: rgba(255,255,255,0.12);
+            color: #aaa;
+            border: 1px solid #444;
+        }
+        .chart-state-badge.active {
+            background: rgba(0,245,212,0.15);
+            color: var(--cyan);
+            border: 1px solid var(--cyan);
+        }
+        .chart-state-dot {
+            width: 6px; height: 6px;
+            border-radius: 50%;
+            background: currentColor;
+        }
         
         .metrics {
             display: grid;
@@ -136,7 +170,6 @@
             padding-bottom: 16px;
             border-bottom: 1px solid var(--border);
         }
-        
         .speed-label {
             display: flex;
             justify-content: space-between;
@@ -144,296 +177,155 @@
             margin-bottom: 8px;
             font-size: 12px;
         }
-        
         .speed-value {
             font-family: 'JetBrains Mono', monospace;
             font-size: 18px;
             font-weight: 600;
             color: var(--cyan);
         }
-        
         .speed-slider {
-            width: 100%;
-            height: 8px;
-            -webkit-appearance: none;
-            appearance: none;
-            background: var(--bg);
-            border-radius: 4px;
-            outline: none;
+            width: 100%; height: 8px;
+            -webkit-appearance: none; appearance: none;
+            background: var(--bg); border-radius: 4px; outline: none;
         }
-        
         .speed-slider::-webkit-slider-thumb {
-            -webkit-appearance: none;
-            appearance: none;
-            width: 20px;
-            height: 20px;
+            -webkit-appearance: none; appearance: none;
+            width: 20px; height: 20px;
             background: linear-gradient(135deg, var(--cyan), var(--blue));
-            border-radius: 50%;
-            cursor: pointer;
-            box-shadow: 0 2px 8px rgba(0, 245, 212, 0.3);
+            border-radius: 50%; cursor: pointer;
+            box-shadow: 0 2px 8px rgba(0,245,212,0.3);
         }
-        
         .speed-slider::-moz-range-thumb {
-            width: 20px;
-            height: 20px;
+            width: 20px; height: 20px;
             background: linear-gradient(135deg, var(--cyan), var(--blue));
-            border-radius: 50%;
-            cursor: pointer;
-            border: none;
+            border-radius: 50%; cursor: pointer; border: none;
         }
-        
         .speed-range {
-            display: flex;
-            justify-content: space-between;
-            font-size: 10px;
-            color: var(--text2);
-            margin-top: 4px;
+            display: flex; justify-content: space-between;
+            font-size: 10px; color: var(--text2); margin-top: 4px;
         }
         
         /* Keyboard Controls */
-        .keyboard-control {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            gap: 8px;
-        }
-        
-        .key-row {
-            display: flex;
-            gap: 8px;
-        }
-        
+        .keyboard-control { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+        .key-row { display: flex; gap: 8px; }
         .key {
-            width: 44px;
-            height: 44px;
+            width: 44px; height: 44px;
             background: var(--bg);
             border: 2px solid var(--border);
             border-radius: 8px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
+            display: flex; align-items: center; justify-content: center;
             font-family: 'JetBrains Mono', monospace;
-            font-size: 14px;
-            font-weight: 600;
-            color: var(--text2);
+            font-size: 14px; font-weight: 600; color: var(--text2);
             transition: all 0.1s;
         }
-        
         .key.active {
-            background: var(--cyan);
-            border-color: var(--cyan);
-            color: var(--bg);
-            box-shadow: 0 0 15px rgba(0, 245, 212, 0.4);
+            background: var(--cyan); border-color: var(--cyan); color: var(--bg);
+            box-shadow: 0 0 15px rgba(0,245,212,0.4);
         }
+        .key-hint { font-size: 10px; color: var(--text2); text-align: center; margin-top: 8px; }
         
-        .key-hint {
-            font-size: 10px;
-            color: var(--text2);
-            text-align: center;
-            margin-top: 8px;
-        }
-        
-        /* Joystick (backup) */
+        /* Joystick */
         .joystick-container {
             width: 120px; height: 120px;
             margin: 12px auto 0;
-            background: var(--bg);
-            border: 2px solid var(--border);
-            border-radius: 50%;
-            position: relative;
-            touch-action: none;
+            background: var(--bg); border: 2px solid var(--border);
+            border-radius: 50%; position: relative; touch-action: none;
         }
         .joystick-knob {
             width: 36px; height: 36px;
             background: linear-gradient(135deg, var(--cyan), var(--blue));
-            border-radius: 50%;
-            position: absolute;
-            top: 50%; left: 50%;
-            transform: translate(-50%, -50%);
-            cursor: grab;
+            border-radius: 50%; position: absolute;
+            top: 50%; left: 50%; transform: translate(-50%,-50%); cursor: grab;
         }
-        .crosshair {
-            position: absolute; inset: 0;
-            pointer-events: none;
-        }
+        .crosshair { position: absolute; inset: 0; pointer-events: none; }
         .crosshair::before, .crosshair::after {
             content: ''; position: absolute; background: var(--border);
         }
         .crosshair::before { width: 1px; height: 100%; left: 50%; }
-        .crosshair::after { height: 1px; width: 100%; top: 50%; }
+        .crosshair::after  { height: 1px; width: 100%; top: 50%; }
         
-        .values {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 8px;
-            margin-top: 12px;
-        }
-        .value-box {
-            background: var(--bg);
-            padding: 8px;
-            border-radius: 6px;
-            text-align: center;
-        }
+        .values { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
+        .value-box { background: var(--bg); padding: 8px; border-radius: 6px; text-align: center; }
         .value-label { font-size: 10px; color: var(--text2); }
         .value-num { font-family: 'JetBrains Mono', monospace; font-size: 14px; color: var(--cyan); }
         
         .btn {
-            width: 100%;
-            padding: 10px;
-            margin-top: 8px;
-            border: none;
-            border-radius: 6px;
-            font-family: inherit;
-            font-size: 12px;
-            font-weight: 600;
-            cursor: pointer;
+            width: 100%; padding: 10px; margin-top: 8px;
+            border: none; border-radius: 6px;
+            font-family: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
         }
-        .btn-primary {
-            background: linear-gradient(135deg, var(--cyan), var(--blue));
-            color: var(--bg);
-        }
-        .btn-secondary {
-            background: var(--bg);
-            color: var(--text);
-            border: 1px solid var(--border);
-        }
+        .btn-primary { background: linear-gradient(135deg, var(--cyan), var(--blue)); color: var(--bg); }
+        .btn-secondary { background: var(--bg); color: var(--text); border: 1px solid var(--border); }
         
         .breakdown { margin-top: 12px; }
         .breakdown-item {
-            display: flex;
-            justify-content: space-between;
-            padding: 8px 0;
-            border-bottom: 1px solid var(--border);
-            font-size: 11px;
+            display: flex; justify-content: space-between;
+            padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 11px;
         }
         .breakdown-item:last-child { border: none; }
         .breakdown-label { display: flex; align-items: center; gap: 6px; }
         .breakdown-dot { width: 8px; height: 8px; border-radius: 2px; }
         .breakdown-val { font-family: 'JetBrains Mono', monospace; font-weight: 600; }
         
-        /* Timestamps */
         .timestamps {
-            background: var(--bg);
-            padding: 10px;
-            border-radius: 6px;
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 10px;
+            background: var(--bg); padding: 10px; border-radius: 6px;
+            font-family: 'JetBrains Mono', monospace; font-size: 10px;
         }
-        .ts-row {
-            display: flex;
-            justify-content: space-between;
-            padding: 4px 0;
-            border-bottom: 1px solid var(--border);
-        }
+        .ts-row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid var(--border); }
         .ts-row:last-child { border: none; }
         .ts-label { color: var(--text2); }
         .ts-val { color: var(--cyan); }
         
         .sync-info {
-            background: var(--bg);
-            padding: 10px;
-            border-radius: 6px;
-            margin-top: 10px;
-            font-size: 10px;
+            background: var(--bg); padding: 10px; border-radius: 6px;
+            margin-top: 10px; font-size: 10px;
         }
         .sync-row { display: flex; justify-content: space-between; margin-bottom: 4px; }
         .sync-row:last-child { margin: 0; }
         .sync-label { color: var(--text2); }
         .sync-val { font-family: 'JetBrains Mono', monospace; color: var(--cyan); }
-        
         .sync-note {
-            margin-top: 10px;
-            padding: 8px;
-            background: rgba(0, 245, 212, 0.1);
-            border-radius: 4px;
-            font-size: 9px;
-            color: var(--cyan);
-            text-align: center;
+            margin-top: 10px; padding: 8px;
+            background: rgba(0,245,212,0.1); border-radius: 4px;
+            font-size: 9px; color: var(--cyan); text-align: center;
         }
         
         .proto-info {
-            margin-top: 12px;
-            padding: 10px;
-            background: var(--bg);
-            border-radius: 6px;
+            margin-top: 12px; padding: 10px;
+            background: var(--bg); border-radius: 6px;
             font-family: 'JetBrains Mono', monospace;
-            font-size: 9px;
-            color: var(--text2);
+            font-size: 9px; color: var(--text2);
         }
         .proto-info code { color: var(--cyan); }
         
-        /* Field Selector */
         .field-info {
-            background: var(--bg);
-            padding: 10px;
-            border-radius: 6px;
-            margin-bottom: 10px;
+            background: var(--bg); padding: 10px; border-radius: 6px; margin-bottom: 10px;
         }
-        .field-info-row {
-            display: flex;
-            justify-content: space-between;
-            margin-bottom: 4px;
-            font-size: 11px;
-        }
+        .field-info-row { display: flex; justify-content: space-between; margin-bottom: 4px; font-size: 11px; }
         .field-info-row:last-child { margin: 0; }
         .field-info-label { color: var(--text2); }
-        .field-info-val {
-            font-family: 'JetBrains Mono', monospace;
-            font-weight: 600;
-            color: var(--cyan);
-        }
+        .field-info-val { font-family: 'JetBrains Mono', monospace; font-weight: 600; color: var(--cyan); }
         
-        .field-selector {
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
-            margin-bottom: 10px;
-        }
-        
+        .field-selector { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
         .field-toggle {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            padding: 6px 10px;
-            background: var(--bg);
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 11px;
-            transition: all 0.15s;
+            display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+            background: var(--bg); border-radius: 6px; cursor: pointer;
+            font-size: 11px; transition: all 0.15s;
         }
         .field-toggle:hover { background: var(--bg3); }
-        
         .field-toggle input[type="checkbox"] {
-            appearance: none;
-            -webkit-appearance: none;
-            width: 16px;
-            height: 16px;
-            border: 2px solid var(--border);
-            border-radius: 3px;
-            cursor: pointer;
-            position: relative;
-            flex-shrink: 0;
+            appearance: none; -webkit-appearance: none;
+            width: 16px; height: 16px;
+            border: 2px solid var(--border); border-radius: 3px;
+            cursor: pointer; position: relative; flex-shrink: 0;
         }
-        .field-toggle input[type="checkbox"]:checked {
-            background: var(--cyan);
-            border-color: var(--cyan);
-        }
+        .field-toggle input[type="checkbox"]:checked { background: var(--cyan); border-color: var(--cyan); }
         .field-toggle input[type="checkbox"]:checked::after {
-            content: '✓';
-            position: absolute;
-            top: -2px;
-            left: 1px;
-            font-size: 12px;
-            color: var(--bg);
-            font-weight: bold;
+            content: '✓'; position: absolute; top: -2px; left: 1px;
+            font-size: 12px; color: var(--bg); font-weight: bold;
         }
-        
         .field-name { flex: 1; color: var(--text); }
-        .field-bit {
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 9px;
-            color: var(--text2);
-        }
+        .field-bit { font-family: 'JetBrains Mono', monospace; font-size: 9px; color: var(--text2); }
 
         @media (max-width: 900px) {
             .main { grid-template-columns: 1fr; }
@@ -458,8 +350,20 @@
         <div class="main">
             <div class="left">
                 <div class="panel">
+                    <!--
+                        Chart panel header.
+                        The "chartStateBadge" span is updated by app.js via
+                        setChartActive() to show IDLE (white bg) / ACTIVE (dark bg).
+                    -->
                     <div class="panel-header" style="display:flex;justify-content:space-between;align-items:center;">
-                        <span>RTT Latency (20s) — scroll to zoom · drag to pan</span>
+                        <span style="display:flex;align-items:center;gap:10px;">
+                            RTT Latency (20s) — scroll to zoom · drag to pan
+                            <!-- Live idle/active badge ───────────────────── -->
+                            <span id="chartStateBadge" class="chart-state-badge idle">
+                                <span class="chart-state-dot"></span>
+                                IDLE
+                            </span>
+                        </span>
                         <button id="resetZoomBtn" style="
                             padding:3px 10px;font-size:10px;font-family:inherit;
                             background:var(--bg);color:var(--text2);
@@ -467,7 +371,7 @@
                             cursor:pointer;letter-spacing:.3px;">Reset Zoom</button>
                     </div>
                     <div class="panel-body">
-                        <!-- uPlot injects its own <canvas> into this div -->
+                        <!-- uPlot canvas is injected here by app.js -->
                         <div id="chart" class="chart-wrap"></div>
                         <div class="metrics">
                             <div class="metric"><div class="metric-label">Total RTT</div><div class="metric-val" id="mRtt">--<span class="metric-unit">ms</span></div></div>
@@ -499,32 +403,23 @@
                 <div class="panel">
                     <div class="panel-header">Keyboard Control</div>
                     <div class="panel-body">
-                        <!-- Speed Control -->
                         <div class="speed-control">
                             <div class="speed-label">
                                 <span>Speed</span>
                                 <span class="speed-value" id="speedValue">1.0</span>
                             </div>
                             <input type="range" id="speedSlider" class="speed-slider" min="1" max="8" step="0.5" value="1">
-                            <div class="speed-range">
-                                <span>1.0</span>
-                                <span>8.0</span>
-                            </div>
+                            <div class="speed-range"><span>1.0</span><span>8.0</span></div>
                         </div>
                         
                         <div class="keyboard-control">
-                            <div class="key-row">
-                                <div class="key" id="key-w">W</div>
-                            </div>
+                            <div class="key-row"><div class="key" id="key-w">W</div></div>
                             <div class="key-row">
                                 <div class="key" id="key-a">A</div>
                                 <div class="key" id="key-s">S</div>
                                 <div class="key" id="key-d">D</div>
                             </div>
-                            <div class="key-hint">
-                                WASD or Arrow Keys to move<br>
-                                Space to stop
-                            </div>
+                            <div class="key-hint">WASD or Arrow Keys to move<br>Space to stop</div>
                         </div>
                         
                         <div class="joystick-container" id="joystick">
@@ -536,7 +431,7 @@
                             <div class="value-box"><div class="value-label">Linear Y</div><div class="value-num" id="linY">0.00</div></div>
                             <div class="value-box"><div class="value-label">Angular Z</div><div class="value-num" id="angZ">0.00</div></div>
                         </div>
-                        <button class="btn btn-primary" id="connectBtn">Connect</button>
+                        <button class="btn btn-primary"   id="connectBtn">Connect</button>
                         <button class="btn btn-secondary" id="stopBtn">Stop (Space)</button>
                     </div>
                 </div>
@@ -558,27 +453,55 @@
                     <div class="panel-header">Field Selector</div>
                     <div class="panel-body">
                         <div class="field-info">
-                            <div class="field-info-row">
-                                <span class="field-info-label">Mask</span>
-                                <span class="field-info-val" id="fieldMask">0x22</span>
-                            </div>
-                            <div class="field-info-row">
-                                <span class="field-info-label">Fields</span>
-                                <span class="field-info-val" id="fieldCount">2/6</span>
-                            </div>
-                            <div class="field-info-row">
-                                <span class="field-info-label">Msg Size</span>
-                                <span class="field-info-val" id="msgSize">34B</span>
-                            </div>
+                            <div class="field-info-row"><span class="field-info-label">Mask</span><span class="field-info-val" id="fieldMask">0x22</span></div>
+                            <div class="field-info-row"><span class="field-info-label">Fields</span><span class="field-info-val" id="fieldCount">2/6</span></div>
+                            <div class="field-info-row"><span class="field-info-label">Msg Size</span><span class="field-info-val" id="msgSize">34B</span></div>
                         </div>
                         <div class="field-selector" id="fieldSelector"></div>
                         
                         <div class="proto-info">
-                            <div>Binary Protocol:</div>
-                            <div><code>0x01</code> Twist (18 + 8×N B)</div>
-                            <div><code>0x02</code> P2P Ack (45B)</div>
-                            <div><code>0x03</code> SyncReq (9B)</div>
-                            <div><code>0x04</code> SyncResp (25B)</div>
+                            <div>Binary Protocol (CRC-8/SMBUS on all msgs):</div>
+                            <div><code>0x01</code> Twist (19 + 8×N B)</div>
+                            <div><code>0x02</code> P2P Ack (46B)</div>
+                            <div><code>0x03</code> SyncReq / Idle Ping (10B)</div>
+                            <div><code>0x04</code> SyncResp / Idle Pong (26B)</div>
+                            <div style="margin-top:8px;border-top:1px solid var(--border);padding-top:8px;display:flex;justify-content:space-between;">
+                                <span>CRC Errors</span>
+                                <span id="crcErrors" style="font-family:'JetBrains Mono',monospace;color:var(--cyan);">0</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel" style="margin-top:16px">
+                    <div class="panel-header" style="display:flex;justify-content:space-between;align-items:center;">
+                        <span>Timestamp Log</span>
+                        <div style="display:flex;gap:6px;">
+                            <button id="clearLogBtn" style="
+                                padding:3px 10px;font-size:10px;font-family:inherit;
+                                background:var(--bg);color:var(--text2);
+                                border:1px solid var(--border);border-radius:4px;cursor:pointer;">
+                                Clear
+                            </button>
+                            <button id="downloadLogBtn" style="
+                                padding:3px 10px;font-size:10px;font-family:inherit;
+                                background:linear-gradient(135deg,var(--cyan),var(--blue));
+                                color:var(--bg);border:none;border-radius:4px;cursor:pointer;font-weight:600;">
+                                ↓ CSV
+                            </button>
+                        </div>
+                    </div>
+                    <div class="panel-body">
+                        <div style="background:var(--bg);padding:10px;border-radius:6px;font-size:10px;">
+                            <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                                <span style="color:var(--text2);">Buffered rows</span>
+                                <span id="logRowCount" style="font-family:'JetBrains Mono',monospace;color:var(--cyan);">0</span>
+                            </div>
+                            <div style="color:var(--text2);line-height:1.6;">
+                                TWIST rows logged on every ack (~20/s while moving).<br>
+                                SYNC rows logged on every clock-sync sample (idle: 1/s, connected: 1/10s).<br>
+                                Max buffer: 100 000 rows (oldest dropped).
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -587,5 +510,30 @@
     </div>
 
     <script src="app.js"></script>
+
+    <script>
+    /*
+     * Badge updater — keeps the IDLE/ACTIVE badge in the chart header
+     * in sync with app.js's setChartActive() by monkey-patching it.
+     *
+     * This runs after app.js is loaded so setChartActive is already defined.
+     */
+    (function patchBadge() {
+        const original = window.setChartActive;
+        if (typeof original !== 'function') return;
+        window.setChartActive = function(active) {
+            original(active);
+            const badge = document.getElementById('chartStateBadge');
+            if (!badge) return;
+            if (active) {
+                badge.className = 'chart-state-badge active';
+                badge.innerHTML = '<span class="chart-state-dot"></span>ACTIVE';
+            } else {
+                badge.className = 'chart-state-badge idle';
+                badge.innerHTML = '<span class="chart-state-dot"></span>IDLE';
+            }
+        };
+    })();
+    </script>
 </body>
 </html>
