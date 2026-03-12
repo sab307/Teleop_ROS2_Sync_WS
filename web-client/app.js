@@ -93,7 +93,7 @@ function checkCrc(buf, label) {
 
 // ============ CONFIG ============
 const CONFIG = {
-    signalUrl: `ws://${location.hostname || 'localhost'}:8080/ws/signal?role=browser`,
+    signalUrl: `ws://${location.hostname || 'localhost'}:8083/ws/signal?role=browser`,
     sendHz: 20,
     chartWindowSec: 20,
     syncIntervalMs: 10000,
