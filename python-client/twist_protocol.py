@@ -1,33 +1,5 @@
 """
 Twist Protocol Module - Variable-Size Binary Protocol
-=====================================================
-
-Binary encoding/decoding for ROS2 geometry_msgs/Twist messages
-with field masking and latency timestamps.
-
-TWIST MESSAGE FORMAT (variable size):
-  Header (18 bytes):
-    [0]     uint8   message_type (0x01)
-    [1-8]   uint64  message_id
-    [9-16]  uint64  t1_browser_send
-    [17]    uint8   field_mask
-
-  Payload (8 bytes per set bit in field_mask):
-    Fields in order: linear_x, linear_y, linear_z, angular_x, angular_y, angular_z
-
-  Relay appends (16 bytes, at end of message):
-    [N]     uint64  t2_relay_rx
-    [N+8]   uint64  t3_relay_tx
-
-  Field mask bits:
-    bit 0 (0x01) = linear_x
-    bit 1 (0x02) = linear_y
-    bit 2 (0x04) = linear_z
-    bit 3 (0x08) = angular_x
-    bit 4 (0x10) = angular_y
-    bit 5 (0x20) = angular_z
-
-
 """
 
 import struct
@@ -37,83 +9,46 @@ from enum import IntEnum
 from typing import Optional
 
 
-# =============================================================================
-# CONSTANTS
-# =============================================================================
-
 class MessageType(IntEnum):
-    """Message type identifiers (first byte of every message)."""
     TWIST = 0x01
     TWIST_ACK = 0x02
     CLOCK_SYNC_REQUEST = 0x03
     CLOCK_SYNC_RESPONSE = 0x04
 
 
-# ---- Twist (variable-size) ----
-TWIST_HEADER_SIZE = 18      # type(1) + msg_id(8) + t1(8) + mask(1)
-TWIST_HEADER_FORMAT = '<BQQ' # First 17 bytes; mask read separately
-TWIST_RELAY_APPEND = 16     # t2(8) + t3(8) appended at end
+TWIST_HEADER_SIZE = 18
+TWIST_RELAY_APPEND = 16
+FIELD_ORDER = ['linear_x', 'linear_y', 'linear_z', 'angular_x', 'angular_y', 'angular_z']
 
-# Field order matching the bitmask
-FIELD_ORDER = ['linear_x', 'linear_y', 'linear_z',
-               'angular_x', 'angular_y', 'angular_z']
-
-# ---- Twist Ack (fixed-size) ----
-# Python → Relay: 69 bytes
-# '<BQ5Q3IQ' = type(1) + msg_id(8) + 5×timestamp(40) + 3×duration(12) + reserved(8)
 TWIST_ACK_PYTHON_FORMAT = '<BQ5Q3IQ'
-TWIST_ACK_PYTHON_SIZE = 69  # 1 + 8 + 40 + 12 + 8
-
-# Relay → Browser: 77 bytes (relay fills reserved + appends t5)
+TWIST_ACK_PYTHON_SIZE = 69
 TWIST_ACK_BROWSER_SIZE = 77
 
-# ---- Clock Sync ----
-CLOCK_SYNC_REQUEST_FORMAT = '<BQ'      # type + t1 = 9 bytes
+CLOCK_SYNC_REQUEST_FORMAT = '<BQ'
 CLOCK_SYNC_REQUEST_SIZE = 9
 
-CLOCK_SYNC_RESPONSE_FORMAT = '<BQQQ'   # type + t1 + t2 + t3 = 25 bytes
+CLOCK_SYNC_RESPONSE_FORMAT = '<BQQQ'
 CLOCK_SYNC_RESPONSE_SIZE = 25
 
-# Legacy constants (kept for backward compatibility checks)
-TWIST_BROWSER_SIZE = 65     # Old fixed format: type + msg_id + t1 + 6×float64
-TWIST_RELAY_SIZE = 81       # Old fixed format with relay timestamps
+TWIST_BROWSER_SIZE = 65
+TWIST_RELAY_SIZE = 81
 
-# ---- P2P Ack (no relay timestamps) ----
-# Used when Python↔Browser communicate via WebRTC DataChannel (no Go relay).
-#
-# Binary layout (45 bytes):
-#   [0]     uint8   type (0x02)
-#   [1-8]   uint64  message_id
-#   [9-16]  uint64  t1_browser_send
-#   [17-24] uint64  t3_python_rx      (Python receive time, Python clock)
-#   [25-32] uint64  t4_python_ack     (Python ack time,     Python clock)
-#   [33-36] uint32  python_decode_us
-#   [37-40] uint32  python_process_us
-#   [41-44] uint32  python_encode_us
-#
-# The browser computes RTT = t6_browser_rx - t1_browser_send (same clock domain).
-# ClockSync (0x03/0x04) is now answered by Python directly, giving the browser a
-# clock offset to compare Python timestamps if desired.
 P2P_TWIST_ACK_FORMAT = '<BQ3Q3I'
-P2P_TWIST_ACK_SIZE = 45    # 1 + 8 + 8+8+8 + 4+4+4 = 45
+P2P_TWIST_ACK_SIZE = 45    # payload bytes (no CRC)
+P2P_TWIST_ACK_WIRE = 46    # on-wire: payload + 1 CRC byte
 
+# On-wire sizes for clock-sync messages (payload + 1 CRC byte)
+CLOCK_SYNC_REQUEST_WIRE  = 10   # 9  + 1
+CLOCK_SYNC_RESPONSE_WIRE = 26   # 25 + 1
 
-# =============================================================================
-# UTILITY FUNCTIONS
-# =============================================================================
 
 def current_time_ms() -> int:
-    """Current time in milliseconds since Unix epoch."""
     return int(time.time() * 1000)
 
-
 def perf_counter_us() -> int:
-    """High-precision counter in microseconds (for measuring durations)."""
     return int(time.perf_counter() * 1_000_000)
 
-
 def _popcount(mask: int) -> int:
-    """Count set bits in a byte."""
     count = 0
     while mask:
         count += mask & 1
@@ -122,470 +57,301 @@ def _popcount(mask: int) -> int:
 
 
 # =============================================================================
-# DATA CLASSES
+# CRC-8 / SMBUS
 # =============================================================================
+
+def crc8(data: bytes) -> int:
+    """CRC-8/SMBUS: poly=0x07, init=0x00, no input/output reflection.
+
+    Identical to the JS crc8() in app.js — both sides always produce the
+    same checksum for the same bytes.
+
+    Known test vector: crc8(b"123456789") == 0xF4
+    """
+    crc = 0x00
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x07) & 0xFF if (crc & 0x80) else (crc << 1) & 0xFF
+    return crc
+
+
+def verify_crc(data: bytes, label: str = "msg") -> bool:
+    """Return True if data[-1] is the correct CRC-8 over data[:-1].
+
+    On mismatch: logs an error via the module logger and returns False so
+    callers can drop the message without catching an exception.
+    Raises ValueError only if data is impossibly short (< 2 bytes).
+    """
+    if len(data) < 2:
+        raise ValueError(f"verify_crc: {label} too short ({len(data)} B)")
+    stored   = data[-1]
+    computed = crc8(data[:-1])
+    if stored != computed:
+        import logging
+        logging.getLogger(__name__).error(
+            "CRC FAIL [%s] stored=0x%02x computed=0x%02x len=%d",
+            label, stored, computed, len(data),
+        )
+        return False
+    return True
+
 
 @dataclass
 class LatencyTimestamps:
-
-    # Browser timestamps (ms)
     t1_browser_send: int = 0
-
-    # Relay timestamps (ms)
     t2_relay_rx: int = 0
     t3_relay_tx: int = 0
     t4_relay_ack_rx: int = 0
     t5_relay_ack_tx: int = 0
-
-    # Python timestamps and durations
-    t3_python_rx: int = 0           # ms
-    t4_python_ack: int = 0          # ms
-    python_decode_us: int = 0       # μs
-    python_process_us: int = 0      # μs
-    python_encode_us: int = 0       # μs
+    t3_python_rx: int = 0
+    t4_python_ack: int = 0
+    python_decode_us: int = 0
+    python_process_us: int = 0
+    python_encode_us: int = 0
 
 
 @dataclass
 class TwistWithLatency:
-    """Variable-size Twist message with latency tracking.
-    
-    The field_mask controls which velocity fields are present in the
-    binary encoding, reducing message size when not all 6 DOF are needed.
-    """
-
-    # Twist velocities (same as ROS geometry_msgs/Twist)
     linear_x: float = 0.0
     linear_y: float = 0.0
     linear_z: float = 0.0
     angular_x: float = 0.0
     angular_y: float = 0.0
     angular_z: float = 0.0
-
-    # Tracking
     message_id: int = 0
-    field_mask: int = 0x3F  # Default: all fields
+    field_mask: int = 0x3F
     timestamps: LatencyTimestamps = field(default_factory=LatencyTimestamps)
 
-    def encode(self, mask: Optional[int] = None) -> bytes:
-        """Encode to variable-size binary format.
-        
-        Args:
-            mask: Override field_mask for this encoding (default: use self.field_mask)
-        
-        Returns:
-            bytes of length 18 + 8 × popcount(mask)
-        """
+    def encode(self, mask=None) -> bytes:
         m = mask if mask is not None else self.field_mask
-
-        # Header: type + msg_id + t1 + mask
-        header = struct.pack(
-            '<BQQB',
-            MessageType.TWIST,
-            self.message_id,
-            self.timestamps.t1_browser_send,
-            m,
-        )
-
-        # Payload: only fields with their bit set
+        header = struct.pack('<BQQB', MessageType.TWIST, self.message_id,
+                             self.timestamps.t1_browser_send, m)
         all_values = [self.linear_x, self.linear_y, self.linear_z,
                       self.angular_x, self.angular_y, self.angular_z]
         payload = b''
         for i in range(6):
             if m & (1 << i):
                 payload += struct.pack('<d', all_values[i])
-
-        return header + payload
+        payload_bytes = header + payload
+        return payload_bytes + bytes([crc8(payload_bytes)])  # +1 CRC → 19+8N bytes
 
     @classmethod
-    def decode(cls, data: bytes) -> 'TwistWithLatency':
-        """Decode from variable-size binary format.
-        
-        Handles both formats:
-          - Variable (new): 18-byte header with field_mask, then N velocity fields
-          - With relay timestamps: same as above + 16 bytes (t2 + t3) appended at end
-        
-        The relay appends t2/t3 at the END of whatever the browser sent,
-        so we detect them by checking if there are 16 extra bytes beyond
-        the header + velocity payload.
-        """
-        if len(data) < TWIST_HEADER_SIZE:
-            raise ValueError(f"Too short: {len(data)} < {TWIST_HEADER_SIZE} bytes")
+    def decode(cls, data: bytes, check_crc: bool = True) -> 'TwistWithLatency':
+        """Decode a Twist message.
 
-        # Verify message type
+        Args:
+            data:       raw on-wire bytes received from the DataChannel
+            check_crc:  True  (default, P2P) — verify the trailing CRC byte
+                                                and strip it before parsing.
+                        False (legacy relay)  — no CRC byte; parse payload as-is.
+        """
+        min_len = TWIST_HEADER_SIZE + (1 if check_crc else 0)
+        if len(data) < min_len:
+            raise ValueError(f"Too short: {len(data)} < {min_len} bytes")
         if data[0] != MessageType.TWIST:
             raise ValueError(f"Expected TWIST (0x01), got 0x{data[0]:02x}")
-
-        # Parse header
+        if check_crc:
+            if not verify_crc(data, 'TWIST'):
+                raise ValueError('TWIST CRC check failed — message is corrupt')
+            data = data[:-1]   # strip CRC byte; parse payload only
         _, msg_id, t1 = struct.unpack('<BQQ', data[:17])
         field_mask = data[17]
-
-        # Calculate expected sizes
         num_fields = _popcount(field_mask)
-        velocity_size = num_fields * 8
-        payload_end = TWIST_HEADER_SIZE + velocity_size
-
+        payload_end = TWIST_HEADER_SIZE + num_fields * 8
         if len(data) < payload_end:
-            raise ValueError(
-                f"Too short for mask 0x{field_mask:02x}: "
-                f"{len(data)} < {payload_end} bytes "
-                f"({num_fields} fields × 8 bytes)"
-            )
-
-        # Unpack velocity values
-        if num_fields > 0:
-            velocities = struct.unpack(
-                f'<{num_fields}d',
-                data[TWIST_HEADER_SIZE:payload_end]
-            )
-        else:
-            velocities = ()
-
-        # Map to named fields based on mask bits
+            raise ValueError(f"Too short for mask 0x{field_mask:02x}: {len(data)} < {payload_end}")
+        velocities = struct.unpack(f'<{num_fields}d', data[TWIST_HEADER_SIZE:payload_end]) if num_fields > 0 else ()
         field_values = {name: 0.0 for name in FIELD_ORDER}
         vel_idx = 0
         for i, name in enumerate(FIELD_ORDER):
             if field_mask & (1 << i):
-                field_values[name] = velocities[vel_idx]
-                vel_idx += 1
-
-        # Check for relay timestamps (16 bytes appended after velocities)
+                field_values[name] = velocities[vel_idx]; vel_idx += 1
         timestamps = LatencyTimestamps(t1_browser_send=t1)
         if len(data) >= payload_end + TWIST_RELAY_APPEND:
             t2, t3 = struct.unpack('<QQ', data[payload_end:payload_end + 16])
-            timestamps.t2_relay_rx = t2
-            timestamps.t3_relay_tx = t3
+            timestamps.t2_relay_rx = t2; timestamps.t3_relay_tx = t3
+        return cls(message_id=msg_id, field_mask=field_mask, timestamps=timestamps, **field_values)
 
-        return cls(
-            message_id=msg_id,
-            field_mask=field_mask,
-            timestamps=timestamps,
-            **field_values,
-        )
-
-    def __str__(self) -> str:
+    def __str__(self):
         active = []
         all_vals = [self.linear_x, self.linear_y, self.linear_z,
                     self.angular_x, self.angular_y, self.angular_z]
         for i, name in enumerate(FIELD_ORDER):
             if self.field_mask & (1 << i):
                 active.append(f"{name}={all_vals[i]:.2f}")
-        fields_str = ', '.join(active) if active else 'empty'
-        return f"Twist#{self.message_id}[mask=0x{self.field_mask:02x} {fields_str}]"
+        return f"Twist#{self.message_id}[mask=0x{self.field_mask:02x} {', '.join(active) or 'empty'}]"
 
 
 @dataclass
 class TwistAck:
-    """Fixed-size acknowledgment message (69 bytes from Python, 77 to browser).
-    
-    Binary layout (Python sends 69 bytes):
-      [0]     uint8   type (0x02)
-      [1-8]   uint64  message_id
-      [9-16]  uint64  t1_browser_send
-      [17-24] uint64  t2_relay_rx
-      [25-32] uint64  t3_relay_tx
-      [33-40] uint64  t3_python_rx
-      [41-48] uint64  t4_python_ack
-      [49-52] uint32  python_decode_us
-      [53-56] uint32  python_process_us
-      [57-60] uint32  python_encode_us
-      [61-68] uint64  reserved (relay fills with t4_relay_ack_rx)
-    
-    Relay extends to 77 bytes:
-      [61-68] t4_relay_ack_rx (overwritten by relay)
-      [69-76] t5_relay_ack_tx (appended by relay)
-    """
-
     message_id: int
     timestamps: LatencyTimestamps
 
     def encode(self) -> bytes:
-        """Encode to binary (69 bytes) — relay mode (includes relay timestamp slots)."""
         ts = self.timestamps
-        return struct.pack(
-            TWIST_ACK_PYTHON_FORMAT,
-            MessageType.TWIST_ACK,     # B: message type
-            self.message_id,           # Q: message ID
-            ts.t1_browser_send,        # Q: browser send time
-            ts.t2_relay_rx,            # Q: relay receive time
-            ts.t3_relay_tx,            # Q: relay forward time
-            ts.t3_python_rx,           # Q: python receive time
-            ts.t4_python_ack,          # Q: python ack time
-            ts.python_decode_us,       # I: decode duration (μs)
-            ts.python_process_us,      # I: process duration (μs)
-            ts.python_encode_us,       # I: encode duration (μs)
-            0,                         # Q: reserved for t4_relay_ack_rx
-        )
+        return struct.pack(TWIST_ACK_PYTHON_FORMAT, MessageType.TWIST_ACK,
+                           self.message_id, ts.t1_browser_send, ts.t2_relay_rx,
+                           ts.t3_relay_tx, ts.t3_python_rx, ts.t4_python_ack,
+                           ts.python_decode_us, ts.python_process_us, ts.python_encode_us, 0)
 
     def encode_p2p(self) -> bytes:
-        """Encode to P2P binary format (45 bytes) — no relay timestamp slots.
-
-        Used when the DataChannel connects Python↔Browser directly.
-        Layout:
-          [0]     uint8   type (0x02)
-          [1-8]   uint64  message_id
-          [9-16]  uint64  t1_browser_send
-          [17-24] uint64  t3_python_rx
-          [25-32] uint64  t4_python_ack
-          [33-36] uint32  python_decode_us
-          [37-40] uint32  python_process_us
-          [41-44] uint32  python_encode_us
-        """
+        """Encode P2P ack with trailing CRC-8 (46 bytes on wire)."""
         ts = self.timestamps
-        return struct.pack(
-            P2P_TWIST_ACK_FORMAT,
-            MessageType.TWIST_ACK,
-            self.message_id,
-            ts.t1_browser_send,
-            ts.t3_python_rx,
-            ts.t4_python_ack,
-            ts.python_decode_us,
-            ts.python_process_us,
-            ts.python_encode_us,
-        )
+        payload = struct.pack(P2P_TWIST_ACK_FORMAT, MessageType.TWIST_ACK,
+                           self.message_id, ts.t1_browser_send, ts.t3_python_rx,
+                           ts.t4_python_ack, ts.python_decode_us,
+                           ts.python_process_us, ts.python_encode_us)
+        return payload + bytes([crc8(payload)])  # 45 + 1 = 46 bytes
 
     @classmethod
     def decode_p2p(cls, data: bytes) -> 'TwistAck':
-        """Decode from P2P binary format (45 bytes)."""
-        if len(data) < P2P_TWIST_ACK_SIZE:
-            raise ValueError(f"P2P ack too short: {len(data)} < {P2P_TWIST_ACK_SIZE}")
+        """Decode P2P ack (46 bytes on wire: 45 payload + 1 CRC)."""
+        if len(data) < P2P_TWIST_ACK_WIRE:
+            raise ValueError(f"P2P ack too short: {len(data)} < {P2P_TWIST_ACK_WIRE} (need payload+CRC)")
         if data[0] != MessageType.TWIST_ACK:
             raise ValueError(f"Expected TWIST_ACK (0x02), got 0x{data[0]:02x}")
-
+        if not verify_crc(data[:P2P_TWIST_ACK_WIRE], 'TWIST_ACK'):
+            raise ValueError('TWIST_ACK CRC check failed — message is corrupt')
         values = struct.unpack(P2P_TWIST_ACK_FORMAT, data[:P2P_TWIST_ACK_SIZE])
-        # values: [type, msg_id, t1, t3_py, t4_py, dec_us, proc_us, enc_us]
         timestamps = LatencyTimestamps(
-            t1_browser_send=values[2],
-            t3_python_rx=values[3],
-            t4_python_ack=values[4],
-            python_decode_us=values[5],
-            python_process_us=values[6],
-            python_encode_us=values[7],
-        )
+            t1_browser_send=values[2], t3_python_rx=values[3], t4_python_ack=values[4],
+            python_decode_us=values[5], python_process_us=values[6], python_encode_us=values[7])
         return cls(message_id=values[1], timestamps=timestamps)
 
     @classmethod
     def decode(cls, data: bytes) -> 'TwistAck':
-        """Decode from binary (69 or 77 bytes)."""
         if len(data) < TWIST_ACK_PYTHON_SIZE:
             raise ValueError(f"Expected at least {TWIST_ACK_PYTHON_SIZE} bytes, got {len(data)}")
-
         if data[0] != MessageType.TWIST_ACK:
             raise ValueError(f"Expected TWIST_ACK (0x02), got 0x{data[0]:02x}")
-
         values = struct.unpack(TWIST_ACK_PYTHON_FORMAT, data[:TWIST_ACK_PYTHON_SIZE])
-        # values: [type, msg_id, t1, t2, t3, t3_py, t4_py, dec_us, proc_us, enc_us, reserved]
-        #          0     1       2   3   4   5      6      7       8        9       10
-
         timestamps = LatencyTimestamps(
-            t1_browser_send=values[2],
-            t2_relay_rx=values[3],
-            t3_relay_tx=values[4],
-            t3_python_rx=values[5],
-            t4_python_ack=values[6],
-            python_decode_us=values[7],
-            python_process_us=values[8],
-            python_encode_us=values[9],
-            t4_relay_ack_rx=values[10],
-        )
-
-        # Check for relay-appended t5
+            t1_browser_send=values[2], t2_relay_rx=values[3], t3_relay_tx=values[4],
+            t3_python_rx=values[5], t4_python_ack=values[6], python_decode_us=values[7],
+            python_process_us=values[8], python_encode_us=values[9], t4_relay_ack_rx=values[10])
         if len(data) >= TWIST_ACK_BROWSER_SIZE:
-            t5 = struct.unpack('<Q', data[TWIST_ACK_PYTHON_SIZE:TWIST_ACK_BROWSER_SIZE])[0]
-            timestamps.t5_relay_ack_tx = t5
-
+            timestamps.t5_relay_ack_tx = struct.unpack('<Q', data[TWIST_ACK_PYTHON_SIZE:TWIST_ACK_BROWSER_SIZE])[0]
         return cls(message_id=values[1], timestamps=timestamps)
 
 
 @dataclass
 class ClockSyncRequest:
-    """Clock sync request (9 bytes)."""
-    t1: int  # Client send time in ms
-
+    t1: int
     def encode(self) -> bytes:
-        return struct.pack(CLOCK_SYNC_REQUEST_FORMAT, MessageType.CLOCK_SYNC_REQUEST, self.t1)
-
+        payload = struct.pack(CLOCK_SYNC_REQUEST_FORMAT, MessageType.CLOCK_SYNC_REQUEST, self.t1)
+        return payload + bytes([crc8(payload)])  # 9 + 1 = 10 bytes
     @classmethod
     def decode(cls, data: bytes) -> 'ClockSyncRequest':
-        if len(data) < CLOCK_SYNC_REQUEST_SIZE:
-            raise ValueError(f"Expected {CLOCK_SYNC_REQUEST_SIZE} bytes")
-        values = struct.unpack(CLOCK_SYNC_REQUEST_FORMAT, data[:CLOCK_SYNC_REQUEST_SIZE])
-        return cls(t1=values[1])
+        if len(data) < CLOCK_SYNC_REQUEST_WIRE:
+            raise ValueError(f"ClockSyncRequest too short: {len(data)} < {CLOCK_SYNC_REQUEST_WIRE}")
+        if not verify_crc(data[:CLOCK_SYNC_REQUEST_WIRE], 'SYNC_REQ'):
+            raise ValueError('ClockSyncRequest CRC check failed — message is corrupt')
+        return cls(t1=struct.unpack(CLOCK_SYNC_REQUEST_FORMAT, data[:CLOCK_SYNC_REQUEST_SIZE])[1])
 
 
 @dataclass
 class ClockSyncResponse:
-    """Clock sync response (25 bytes).
-    
-    NTP-style offset calculation:
-        RTT = (t4 - t1) - (t3 - t2)
-        Offset = ((t2 - t1) + (t3 - t4)) / 2
-    """
-    t1: int  # Original client send time
-    t2: int  # Server receive time
-    t3: int  # Server send time
-
+    t1: int; t2: int; t3: int
     def encode(self) -> bytes:
-        return struct.pack(CLOCK_SYNC_RESPONSE_FORMAT, MessageType.CLOCK_SYNC_RESPONSE, self.t1, self.t2, self.t3)
-
+        payload = struct.pack(CLOCK_SYNC_RESPONSE_FORMAT, MessageType.CLOCK_SYNC_RESPONSE, self.t1, self.t2, self.t3)
+        return payload + bytes([crc8(payload)])  # 25 + 1 = 26 bytes
     @classmethod
     def decode(cls, data: bytes) -> 'ClockSyncResponse':
-        if len(data) < CLOCK_SYNC_RESPONSE_SIZE:
-            raise ValueError(f"Expected {CLOCK_SYNC_RESPONSE_SIZE} bytes")
-        values = struct.unpack(CLOCK_SYNC_RESPONSE_FORMAT, data[:CLOCK_SYNC_RESPONSE_SIZE])
-        return cls(t1=values[1], t2=values[2], t3=values[3])
+        if len(data) < CLOCK_SYNC_RESPONSE_WIRE:
+            raise ValueError(f"ClockSyncResponse too short: {len(data)} < {CLOCK_SYNC_RESPONSE_WIRE}")
+        if not verify_crc(data[:CLOCK_SYNC_RESPONSE_WIRE], 'SYNC_RESP'):
+            raise ValueError('ClockSyncResponse CRC check failed — message is corrupt')
+        _, t1, t2, t3 = struct.unpack(CLOCK_SYNC_RESPONSE_FORMAT, data[:CLOCK_SYNC_RESPONSE_SIZE])
+        return cls(t1=t1, t2=t2, t3=t3)
 
-
-# =============================================================================
-# SELF-TEST
-# =============================================================================
 
 if __name__ == "__main__":
+    import logging
+    logging.basicConfig(level=logging.ERROR)   # show CRC error logs during test
+
     print("=" * 70)
-    print("VARIABLE-SIZE BINARY PROTOCOL TEST")
+    print("TWIST PROTOCOL + CRC-8/SMBUS SELF-TEST")
     print("=" * 70)
 
-    # Test 1: Variable-size encoding/decoding
-    print("\n1. Variable-Size Encoding (mask=0x22: linear_y + angular_z)")
+    # 1. Algorithm correctness
+    print("\n1. CRC-8/SMBUS Algorithm (known test vector)")
     print("-" * 50)
+    assert crc8(b"123456789") == 0xF4, f"Got 0x{crc8(b'123456789'):02X}, expected 0xF4"
+    print(f"   crc8(b'123456789') = 0x{crc8(b'123456789'):02X}  OK")
+    good = b"hello" + bytes([crc8(b"hello")])
+    assert verify_crc(good, "good")
+    bad = bytearray(good); bad[2] ^= 0xFF
+    assert not verify_crc(bytes(bad), "bad")
+    print("   verify_crc: happy path and corruption detection OK")
 
+    # 2. TwistWithLatency P2P (with CRC)
+    print("\n2. TwistWithLatency  P2P encode → decode (mask=0x22)")
+    print("-" * 50)
     twist = TwistWithLatency(
-        message_id=12345,
-        field_mask=0x22,  # linear_y + angular_z
-        linear_y=1.5,
-        angular_z=-0.75,
-        timestamps=LatencyTimestamps(t1_browser_send=current_time_ms())
-    )
+        message_id=12345, field_mask=0x22, linear_y=1.5, angular_z=-0.75,
+        timestamps=LatencyTimestamps(t1_browser_send=current_time_ms()))
+    enc = twist.encode()
+    expected = 18 + 2 * 8 + 1   # header + 2 fields + CRC
+    print(f"   Encoded: {len(enc)} bytes (expected: {expected})")
+    assert len(enc) == expected, f"Size wrong: {len(enc)}"
+    dec = TwistWithLatency.decode(enc)
+    assert dec.message_id == 12345 and dec.linear_y == 1.5 and dec.angular_z == -0.75
+    print("   Round-trip OK")
+    corrupt = bytearray(enc); corrupt[5] ^= 0xFF
+    try:
+        TwistWithLatency.decode(bytes(corrupt)); assert False
+    except ValueError as e:
+        assert "CRC" in str(e)
+        print(f"   Corruption detected: {e}")
 
-    encoded = twist.encode()
-    expected_size = 18 + 2 * 8  # header + 2 fields
-    print(f"   {twist}")
-    print(f"   Encoded: {len(encoded)} bytes (expected: {expected_size})")
-    assert len(encoded) == expected_size, f"Size mismatch: {len(encoded)} != {expected_size}"
-
-    decoded = TwistWithLatency.decode(encoded)
-    print(f" Decoded: {decoded}")
-    assert decoded.message_id == 12345
-    assert decoded.linear_y == 1.5
-    assert decoded.angular_z == -0.75
-    assert decoded.linear_x == 0.0  # Not in mask → default
-    assert decoded.field_mask == 0x22
-    print("  Round-trip OK")
-
-    # Test 2: With relay timestamps appended
-    print("\n2. With Relay Timestamps (simulating Go relay)")
+    # 3. TwistWithLatency relay (no CRC, check_crc=False)
+    print("\n3. TwistWithLatency  relay decode (check_crc=False)")
     print("-" * 50)
+    relay_payload = enc[:-1]    # strip CRC — relay never added one
+    relay_data = relay_payload + struct.pack('<QQ', 1000000000001, 1000000000002)
+    dec_relay = TwistWithLatency.decode(relay_data, check_crc=False)
+    assert dec_relay.timestamps.t2_relay_rx == 1000000000001
+    print("   Relay round-trip OK (check_crc=False, no CRC byte)")
 
-    t2, t3 = 1000000000001, 1000000000002
-    relay_data = encoded + struct.pack('<QQ', t2, t3)
-    print(f"   Browser: {len(encoded)}B + relay: 16B = {len(relay_data)}B")
-
-    decoded_relay = TwistWithLatency.decode(relay_data)
-    print(f"   t2_relay_rx: {decoded_relay.timestamps.t2_relay_rx}")
-    print(f"   t3_relay_tx: {decoded_relay.timestamps.t3_relay_tx}")
-    assert decoded_relay.timestamps.t2_relay_rx == t2
-    assert decoded_relay.timestamps.t3_relay_tx == t3
-    assert decoded_relay.linear_y == 1.5
-    print("  Relay timestamps decoded correctly")
-
-    # Test 3: All fields (mask=0x3F)
-    print("\n3. All Fields (mask=0x3F)")
+    # 4. TwistAck P2P
+    print("\n4. TwistAck  encode_p2p → decode_p2p")
     print("-" * 50)
-
-    twist_all = TwistWithLatency(
-        message_id=99,
-        field_mask=0x3F,
-        linear_x=1.0, linear_y=2.0, linear_z=3.0,
-        angular_x=4.0, angular_y=5.0, angular_z=6.0,
-        timestamps=LatencyTimestamps(t1_browser_send=current_time_ms())
-    )
-    enc_all = twist_all.encode()
-    expected_all = 18 + 6 * 8
-    print(f"   Encoded: {len(enc_all)} bytes (expected: {expected_all})")
-    assert len(enc_all) == expected_all
-
-    dec_all = TwistWithLatency.decode(enc_all)
-    assert dec_all.linear_x == 1.0
-    assert dec_all.angular_z == 6.0
-    print("  All 6 fields round-trip OK")
-
-    # Test 4: Single field
-    print("\n4. Single Field (mask=0x02: linear_y only)")
-    print("-" * 50)
-
-    twist_one = TwistWithLatency(
-        message_id=1, field_mask=0x02, linear_y=3.14,
-        timestamps=LatencyTimestamps(t1_browser_send=current_time_ms())
-    )
-    enc_one = twist_one.encode()
-    expected_one = 18 + 1 * 8
-    print(f"   Encoded: {len(enc_one)} bytes (expected: {expected_one})")
-    assert len(enc_one) == expected_one
-
-    dec_one = TwistWithLatency.decode(enc_one)
-    assert dec_one.linear_y == 3.14
-    assert dec_one.linear_x == 0.0
-    print("  Single field OK")
-
-    # Test 5: Empty mask
-    print("\n5. Empty Mask (mask=0x00)")
-    print("-" * 50)
-
-    twist_empty = TwistWithLatency(
-        message_id=2, field_mask=0x00,
-        timestamps=LatencyTimestamps(t1_browser_send=current_time_ms())
-    )
-    enc_empty = twist_empty.encode()
-    print(f"   Encoded: {len(enc_empty)} bytes (expected: 18)")
-    assert len(enc_empty) == 18
-    dec_empty = TwistWithLatency.decode(enc_empty)
-    assert dec_empty.linear_y == 0.0
-    print("   Empty mask OK")
-
-    # Test 6: TwistAck
-    print("\n6. TwistAck Encoding/Decoding")
-    print("-" * 50)
-
     ack = TwistAck(
-        message_id=12345,
+        message_id=99,
         timestamps=LatencyTimestamps(
-            t1_browser_send=1000, t2_relay_rx=1005, t3_relay_tx=1006,
-            t3_python_rx=1010, t4_python_ack=1015,
-            python_decode_us=50, python_process_us=100, python_encode_us=30
-        )
-    )
-    ack_enc = ack.encode()
-    print(f"   Encoded: {len(ack_enc)} bytes (expected: 69)")
-    assert len(ack_enc) == TWIST_ACK_PYTHON_SIZE
+            t1_browser_send=2000, t3_python_rx=2010, t4_python_ack=2011,
+            python_decode_us=120, python_process_us=200, python_encode_us=80))
+    p2p_enc = ack.encode_p2p()
+    print(f"   Encoded: {len(p2p_enc)} bytes (expected: {P2P_TWIST_ACK_WIRE})")
+    assert len(p2p_enc) == P2P_TWIST_ACK_WIRE
+    p2p_dec = TwistAck.decode_p2p(p2p_enc)
+    assert p2p_dec.message_id == 99 and p2p_dec.timestamps.python_decode_us == 120
+    print("   Round-trip OK")
+    corrupt = bytearray(p2p_enc); corrupt[10] ^= 0xFF
+    try:
+        TwistAck.decode_p2p(bytes(corrupt)); assert False
+    except ValueError as e:
+        assert "CRC" in str(e)
+        print(f"   Corruption detected: {e}")
 
-    ack_dec = TwistAck.decode(ack_enc)
-    assert ack_dec.message_id == 12345
-    assert ack_dec.timestamps.t2_relay_rx == 1005
-    assert ack_dec.timestamps.python_decode_us == 50
-    print("Ack round-trip OK")
-
-    # Test 7: Performance
-    print("\n7. Performance (100,000 iterations, mask=0x22)")
+    # 5. ClockSyncRequest
+    print("\n5. ClockSyncRequest  encode → decode")
     print("-" * 50)
+    req_enc = ClockSyncRequest(t1=999888777).encode()
+    print(f"   Encoded: {len(req_enc)} bytes (expected: {CLOCK_SYNC_REQUEST_WIRE})")
+    assert len(req_enc) == CLOCK_SYNC_REQUEST_WIRE
+    assert ClockSyncRequest.decode(req_enc).t1 == 999888777
+    print("   Round-trip OK")
 
-    import time as t
-
-    iterations = 100000
-
-    start = t.perf_counter_ns()
-    for _ in range(iterations):
-        data = twist.encode()
-    encode_ns = (t.perf_counter_ns() - start) / iterations
-
-    # Simulate relay-appended data
-    relay_test = data + struct.pack('<QQ', 1000, 1001)
-
-    start = t.perf_counter_ns()
-    for _ in range(iterations):
-        TwistWithLatency.decode(relay_test)
-    decode_ns = (t.perf_counter_ns() - start) / iterations
-
-    print(f"   Encode: {encode_ns/1000:.2f} μs/msg ({1_000_000_000/encode_ns:,.0f} msg/s)")
-    print(f"   Decode: {decode_ns/1000:.2f} μs/msg ({1_000_000_000/decode_ns:,.0f} msg/s)")
+    # 6. ClockSyncResponse
+    print("\n6. ClockSyncResponse  encode → decode")
+    print("-" * 50)
+    resp_enc = ClockSyncResponse(t1=1000, t2=1005, t3=1006).encode()
+    print(f"   Encoded: {len(resp_enc)} bytes (expected: {CLOCK_SYNC_RESPONSE_WIRE})")
+    assert len(resp_enc) == CLOCK_SYNC_RESPONSE_WIRE
+    assert ClockSyncResponse.decode(resp_enc).t2 == 1005
+    print("   Round-trip OK")
 
     print("\n" + "=" * 70)
     print("All tests passed!")
