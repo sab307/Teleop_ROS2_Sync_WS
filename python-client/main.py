@@ -11,13 +11,14 @@ The Go server is ONLY used for the initial WebRTC handshake (SDP + ICE).
 Once the RTCDataChannel opens, all data flows directly to the browser.
 
 Architecture:
+  Python ←──WS(signaling)──→ Go ←──WS(signaling)──→ Browser
   Python ←──────────── RTCDataChannel (P2P) ────────────────→ Browser
 
-Binary Protocol (over DataChannel):
-  0x01  Twist          Browser → Python (variable size, no relay timestamps)
-  0x02  P2P Ack        Python → Browser (45 bytes, no relay timestamps)
-  0x03  ClockSyncReq   Browser → Python (9 bytes)
-  0x04  ClockSyncResp  Python → Browser (25 bytes)
+Binary Protocol (over DataChannel, all messages include trailing CRC-8/SMBUS byte):
+  0x01  Twist          Browser → Python (19 + 8×N bytes)
+  0x02  P2P Ack        Python → Browser (46 bytes)
+  0x03  ClockSyncReq   Browser → Python (10 bytes)
+  0x04  ClockSyncResp  Python → Browser (26 bytes)
 
 Usage:
     python main.py [--signal ws://localhost:8080/ws/signal] [--topic /cmd_vel]
@@ -28,12 +29,15 @@ Dependencies:
 
 import asyncio
 import argparse
+import csv
 import json
 import logging
+import os
 import signal
 import sys
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional, Callable
 
 import aiohttp
@@ -146,6 +150,118 @@ class Stats:
         )
 
 
+# ─── Timestamp File Logger ────────────────────────────────────────────────────
+
+class TimestampFileLogger:
+    """Writes every Twist and ClockSync event to a CSV log file.
+
+    Twist rows (type="TWIST"):
+        time_iso          UTC wall-clock when the ack was sent (ISO-8601)
+        seq               Running counter shared across TWIST + SYNC rows
+        msg_id            Browser message ID
+        t1_browser_ms     Browser send timestamp  (ms, browser epoch)
+        t3_python_rx_ms   Python receive timestamp (ms, Python epoch)
+        t4_python_ack_ms  Python ack timestamp     (ms, Python epoch)
+        approx_lat_ms     t3 - t1  (raw, no clock correction — trend indicator)
+        decode_us / process_us / encode_us   Per-stage Python durations (μs)
+        total_python_us   decode + process + encode
+        linear_x/y/z      Velocity fields
+        angular_x/y/z     Velocity fields
+
+    ClockSync rows (type="SYNC"):
+        time_iso
+        seq
+        t1_browser_ms     Browser send time (echoed back)
+        t2_python_rx_ms   Python receive time
+        t3_python_tx_ms   Python transmit time
+        sync_proc_us      (t3 - t2) in μs
+    """
+
+    ALL_FIELDS = [
+        'time_iso', 'type', 'seq', 'msg_id',
+        't1_browser_ms', 't3_python_rx_ms', 't4_python_ack_ms',
+        'approx_lat_ms',
+        'decode_us', 'process_us', 'encode_us', 'total_python_us',
+        'linear_x', 'linear_y', 'linear_z',
+        'angular_x', 'angular_y', 'angular_z',
+        # SYNC-only columns (empty for TWIST rows)
+        't2_python_rx_ms', 't3_python_tx_ms', 'sync_proc_us',
+    ]
+
+    def __init__(self, path: str):
+        self._path   = path
+        self._seq    = 0
+        self._fh     = None
+        self._writer = None
+
+    def open(self):
+        """Open (or append to) the CSV file; write column header if new."""
+        new_file = not os.path.exists(self._path) or os.path.getsize(self._path) == 0
+        self._fh = open(self._path, 'a', newline='', encoding='utf-8')
+        self._writer = csv.DictWriter(
+            self._fh, fieldnames=self.ALL_FIELDS, extrasaction='ignore',
+        )
+        if new_file:
+            self._writer.writeheader()
+            self._fh.flush()
+        logger.info(f"Timestamp log → {os.path.abspath(self._path)}")
+
+    def close(self):
+        if self._fh:
+            self._fh.flush()
+            self._fh.close()
+            self._fh = None
+
+    @staticmethod
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat(timespec='milliseconds')
+
+    def log_twist(self, twist) -> None:
+        """Append one TWIST row (called after encode_us is populated)."""
+        if self._writer is None:
+            return
+        self._seq += 1
+        ts       = twist.timestamps
+        total_us = ts.python_decode_us + ts.python_process_us + ts.python_encode_us
+        self._writer.writerow({
+            'time_iso':         self._now_iso(),
+            'type':             'TWIST',
+            'seq':              self._seq,
+            'msg_id':           twist.message_id,
+            't1_browser_ms':    ts.t1_browser_send,
+            't3_python_rx_ms':  ts.t3_python_rx,
+            't4_python_ack_ms': ts.t4_python_ack,
+            'approx_lat_ms':    ts.t3_python_rx - ts.t1_browser_send,
+            'decode_us':        ts.python_decode_us,
+            'process_us':       ts.python_process_us,
+            'encode_us':        ts.python_encode_us,
+            'total_python_us':  total_us,
+            'linear_x':         round(twist.linear_x,  6),
+            'linear_y':         round(twist.linear_y,  6),
+            'linear_z':         round(twist.linear_z,  6),
+            'angular_x':        round(twist.angular_x, 6),
+            'angular_y':        round(twist.angular_y, 6),
+            'angular_z':        round(twist.angular_z, 6),
+        })
+        self._fh.flush()
+
+    def log_sync(self, t1: int, t2: int, t3: int) -> None:
+        """Append one SYNC row."""
+        if self._writer is None:
+            return
+        self._seq += 1
+        self._writer.writerow({
+            'time_iso':         self._now_iso(),
+            'type':             'SYNC',
+            'seq':              self._seq,
+            't1_browser_ms':    t1,
+            't2_python_rx_ms':  t2,
+            't3_python_tx_ms':  t3,
+            'sync_proc_us':     (t3 - t2) * 1000,   # ms → μs
+        })
+        self._fh.flush()
+
+
 # ─── P2P Twist Client ─────────────────────────────────────────────────────────
 
 class P2PTwistClient:
@@ -161,6 +277,7 @@ class P2PTwistClient:
         signal_url: str,
         on_twist: Optional[Callable] = None,
         ros2_topic: Optional[str] = None,
+        ts_logger: Optional['TimestampFileLogger'] = None,
     ):
         # Ensure URL has ?role=python
         if "?" in signal_url:
@@ -168,8 +285,9 @@ class P2PTwistClient:
         else:
             self._signal_url = f"{signal_url}?role=python"
 
-        self.on_twist = on_twist
-        self.stats = Stats()
+        self.on_twist  = on_twist
+        self.stats     = Stats()
+        self._ts_log   = ts_logger   # TimestampFileLogger (may be None)
 
         # WebSocket signaling state
         self._session: Optional[aiohttp.ClientSession] = None
@@ -396,16 +514,38 @@ class P2PTwistClient:
         process_us = perf_counter_us() - process_start
         twist.timestamps.python_process_us = process_us
 
-        # Build and send P2P Ack
+        # Build and send P2P Ack (also sets python_encode_us on twist.timestamps)
         await self._send_ack_p2p(twist)
 
-        # Stats (local time diff; useful without clock sync)
-        latency = rx_time - twist.timestamps.t1_browser_send
-        self.stats.record(latency, decode_us, process_us, twist.timestamps.python_encode_us)
-        logger.debug(
-            f"Twist #{twist.message_id}: "
-            f"lat≈{latency}ms dec={decode_us}μs proc={process_us}μs"
+        # ── Timestamp logging ────────────────────────────────────────────────
+        ts        = twist.timestamps
+        approx    = rx_time - ts.t1_browser_send   # raw, no clock correction
+        total_us  = ts.python_decode_us + ts.python_process_us + ts.python_encode_us
+
+        logger.info(
+            f"Twist #{twist.message_id:>6}  "
+            f"t1={ts.t1_browser_send}ms  "
+            f"t3={ts.t3_python_rx}ms  "
+            f"t4={ts.t4_python_ack}ms  "
+            f"approx_lat={approx:+.0f}ms  "
+            f"[dec={ts.python_decode_us}μs  "
+            f"proc={ts.python_process_us}μs  "
+            f"enc={ts.python_encode_us}μs  "
+            f"total={total_us}μs]"
         )
+        logger.debug(
+            f"  velocities  lx={twist.linear_x:.3f}  ly={twist.linear_y:.3f}  "
+            f"lz={twist.linear_z:.3f}  ax={twist.angular_x:.3f}  "
+            f"ay={twist.angular_y:.3f}  az={twist.angular_z:.3f}  "
+            f"mask=0x{twist.field_mask:02x}"
+        )
+
+        # Write to CSV file (if logger is configured)
+        if self._ts_log:
+            self._ts_log.log_twist(twist)
+
+        # Rolling stats
+        self.stats.record(approx, ts.python_decode_us, ts.python_process_us, ts.python_encode_us)
 
     async def _send_ack_p2p(self, twist: TwistWithLatency):
         """Encode and send a P2P Ack (45 bytes) over the DataChannel."""
@@ -440,33 +580,43 @@ class P2PTwistClient:
             logger.error(f"DataChannel send error: {e}")
 
     async def _handle_clock_sync(self, data: bytes):
-        """
-        Respond to a ClockSync request from the browser.
+        """Respond to a ClockSync request from the browser (P2P mode).
 
-        In relay mode, the Go server handled clock sync responses.
-        In P2P mode, Python responds directly so the browser can compute
-        the Python↔Browser clock offset for cross-domain timestamp comparison.
+        Request  (10 bytes): [0x03] [t1: uint64] [CRC]
+        Response (26 bytes): [0x04] [t1: uint64] [t2: uint64] [t3: uint64] [CRC]
 
-        Request  (9 bytes):  [0x03] [t1: uint64]
-        Response (25 bytes): [0x04] [t1: uint64] [t2: uint64] [t3: uint64]
+        t2 is captured on entry (before decode) and t3 is captured just before
+        encoding the response so the browser's NTP formula has tight brackets.
         """
         if self._dc is None or self._dc.readyState != "open":
             return
 
-        t2 = current_time_ms()
+        t2 = current_time_ms()   # Python receive time — captured before decode
         try:
             req = ClockSyncRequest.decode(data)
         except Exception as e:
             logger.error(f"ClockSync decode error: {e}")
             return
 
-        t3 = current_time_ms()
+        t3 = current_time_ms()   # Python transmit time — as late as possible
         resp = ClockSyncResponse(t1=req.t1, t2=t2, t3=t3)
         try:
             self._dc.send(resp.encode())
-            logger.debug(f"ClockSync: t1={req.t1} t2={t2} t3={t3}")
         except Exception as e:
             logger.error(f"ClockSync send error: {e}")
+            return
+
+        proc_us = (t3 - t2) * 1000   # ms → μs (usually 0 or 1 ms)
+        logger.info(
+            f"ClockSync  "
+            f"t1(browser)={req.t1}ms  "
+            f"t2(py_rx)={t2}ms  "
+            f"t3(py_tx)={t3}ms  "
+            f"proc={proc_us}μs"
+        )
+
+        if self._ts_log:
+            self._ts_log.log_sync(req.t1, t2, t3)
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -511,6 +661,17 @@ def parse_args():
     )
     p.add_argument("--topic", "-t", default=None, help="ROS2 topic name")
     p.add_argument("--verbose", "-v", action="store_true")
+    p.add_argument(
+        "--log-file", "-l",
+        default="teleop_timestamps.csv",
+        metavar="PATH",
+        help="CSV file for per-message timestamp log (default: teleop_timestamps.csv)"
+    )
+    p.add_argument(
+        "--no-log-file",
+        action="store_true",
+        help="Disable CSV timestamp logging entirely"
+    )
     return p.parse_args()
 
 
@@ -520,12 +681,21 @@ async def main():
         logging.getLogger().setLevel(logging.DEBUG)
 
     print()
-   
-    print(f"  Signal URL: {args.signal}")
-    print(f"  ROS2 topic: {args.topic or 'disabled'}")
+    print(f"  Signal URL : {args.signal}")
+    print(f"  ROS2 topic : {args.topic or 'disabled'}")
+    print(f"  Timestamp log : {'disabled' if args.no_log_file else args.log_file}")
     print()
 
-    client = P2PTwistClient(signal_url=args.signal, ros2_topic=args.topic)
+    ts_logger = None
+    if not args.no_log_file:
+        ts_logger = TimestampFileLogger(args.log_file)
+        ts_logger.open()
+
+    client = P2PTwistClient(
+        signal_url=args.signal,
+        ros2_topic=args.topic,
+        ts_logger=ts_logger,
+    )
 
     shutdown = asyncio.Event()
     loop = asyncio.get_event_loop()
@@ -548,6 +718,10 @@ async def main():
         await asyncio.gather(stats_task, client_task, return_exceptions=True)
     except Exception:
         pass
+
+    if ts_logger:
+        ts_logger.close()
+        logger.info(f"Timestamp log closed: {args.log_file}")
 
     return 0
 
