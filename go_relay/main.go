@@ -360,7 +360,7 @@ func corsMiddleware(next http.Handler) http.Handler {
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8083"
+		port = "8443"
 	}
 
 	mux := http.NewServeMux()
