@@ -97,9 +97,9 @@ const CONFIG = {
     sendHz: 20,
     chartWindowSec: 20,
     syncIntervalMs: 10000,
-    minSpeed: 1.0,
-    maxSpeed: 8.0,
-    defaultSpeed: 1.0,
+    minSpeed: 0.05,
+    maxSpeed: 1.0,
+    defaultSpeed: 0.5,
     keyRepeatMs: 50,
     iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
     debugLog: false,
@@ -815,8 +815,17 @@ function sendTwist() {
     if (isMoving) {
         // ── Send actual Twist message ──────────────────────────────────────
         msgId++;
-        const t1         = now();
-        const velocities = { lx: 0, ly: linY, lz: 0, ax: 0, ay: 0, az: angZ };
+        const t1 = now();
+        // Map forward axis to the first enabled linear field (x → y → z priority)
+        // Map turn axis to the first enabled angular field (z → x → y priority,
+        // matching the ROS2 convention where angular.z is yaw).
+        const velocities = { lx: 0, ly: 0, lz: 0, ax: 0, ay: 0, az: 0 };
+        if      (fieldMask & FIELD_LINEAR_X) velocities.lx = linY;
+        else if (fieldMask & FIELD_LINEAR_Y) velocities.ly = linY;
+        else if (fieldMask & FIELD_LINEAR_Z) velocities.lz = linY;
+        if      (fieldMask & FIELD_ANGULAR_Z) velocities.az = angZ;
+        else if (fieldMask & FIELD_ANGULAR_X) velocities.ax = angZ;
+        else if (fieldMask & FIELD_ANGULAR_Y) velocities.ay = angZ;
         const buf        = encodeTwist(msgId, t1, velocities);
         try {
             dc.send(buf);
@@ -1074,12 +1083,29 @@ function setupSpeedControl() {
     const display = document.getElementById('speedValue');
     if (!slider || !display) return;
     slider.min = CONFIG.minSpeed; slider.max = CONFIG.maxSpeed;
-    slider.step = 0.5; slider.value = CONFIG.defaultSpeed;
+    slider.step = 0.05; slider.value = CONFIG.defaultSpeed;
     display.textContent = CONFIG.defaultSpeed.toFixed(1);
     slider.addEventListener('input', (e) => {
         currentSpeed = parseFloat(e.target.value);
         display.textContent = currentSpeed.toFixed(1);
         if (keysPressed.size > 0) updateFromKeys();
+    });
+}
+
+// ============ HZ SELECTOR ============
+function setupHzSelector() {
+    const sel     = document.getElementById('hzSelector');
+    const display = document.getElementById('hzValue');
+    if (!sel) return;
+    sel.addEventListener('change', (e) => {
+        CONFIG.sendHz = parseInt(e.target.value, 10);
+        if (display) display.textContent = `${CONFIG.sendHz} Hz`;
+        // Restart the send timer at the new rate if currently sending
+        if (sendTimer) {
+            stopSending();
+            startSending();
+        }
+        logInfo('send', `Send rate changed to ${CONFIG.sendHz} Hz`);
     });
 }
 
@@ -1122,6 +1148,7 @@ function init() {
     setupKeyboard();
     setupJoystick();
     setupSpeedControl();
+    setupHzSelector();
     setupFieldSelector();
 
     const connectBtn     = document.getElementById('connectBtn');
