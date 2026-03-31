@@ -48,8 +48,10 @@ MESSAGE ENVELOPE (all JSON):
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"sync"
@@ -356,26 +358,105 @@ func corsMiddleware(next http.Handler) http.Handler {
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
+//
+// Flags take priority; env vars are used as fallbacks when a flag is omitted.
+//
+// Examples:
+//   # Plain HTTP (development)
+//   go run . --port 8080
+//
+//   # HTTPS / WSS with self-signed cert
+//   go run . --port 8443 --tls-cert certs/cert.pem --tls-key certs/key.pem
+//
+//   # Or equivalently via env vars
+//   TLS_CERT=certs/cert.pem TLS_KEY=certs/key.pem PORT=8443 ./go_relay
+//
+//   # Custom HTTP-redirect port (only relevant when TLS is active)
+//   go run . --port 8443 --http-port 8080 --tls-cert certs/cert.pem --tls-key certs/key.pem
 
 func main() {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8443"
-	}
+	// ── Flag definitions (env-var fallbacks shown in usage strings) ───────────
+	fPort     := flag.String("port",      envOr("PORT",      "8443"), "HTTPS/WSS listen port (env: PORT)")
+	fHTTPPort := flag.String("http-port", envOr("HTTP_PORT", "8080"), "HTTP→HTTPS redirect port, TLS only (env: HTTP_PORT)")
+	fCert     := flag.String("tls-cert",  envOr("TLS_CERT",  ""),     "Path to TLS certificate PEM (env: TLS_CERT)")
+	fKey      := flag.String("tls-key",   envOr("TLS_KEY",   ""),     "Path to TLS private key PEM (env: TLS_KEY)")
+	fWebRoot  := flag.String("web-root",  "../web-client",             "Directory to serve as the web root")
+	flag.Parse()
+
+	port     := *fPort
+	httpPort := *fHTTPPort
+	certFile := *fCert
+	keyFile  := *fKey
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws/signal", handleSignal)
 	mux.HandleFunc("/health", handleHealth)
 	mux.HandleFunc("/status", handleStatus)
-	mux.Handle("/", http.FileServer(http.Dir("../web-client")))
+	mux.Handle("/", http.FileServer(http.Dir(*fWebRoot)))
+
+	handler := corsMiddleware(mux)
 
 	fmt.Println()
-	fmt.Printf("Listening on :%s\n", port)
-	fmt.Println("  WS  /ws/signal?role=python   Python peer")
-	fmt.Println("  WS  /ws/signal?role=browser  Browser peer")
-	fmt.Println("  GET /health                  Health check")
-	fmt.Println("  GET /status                  Status JSON")
-	fmt.Println()
+	if certFile != "" && keyFile != "" {
+		// ── HTTPS / WSS mode ─────────────────────────────────────────────────
+		fmt.Printf("  Mode      : HTTPS / WSS (TLS enabled)\n")
+		fmt.Printf("  HTTPS     : https://localhost:%s\n", port)
+		fmt.Printf("  WSS       : wss://localhost:%s/ws/signal\n", port)
+		fmt.Printf("  Cert      : %s\n", certFile)
+		fmt.Printf("  Key       : %s\n", keyFile)
+		fmt.Printf("  Web root  : %s\n", *fWebRoot)
+		fmt.Println()
+		fmt.Println("  WSS  /ws/signal?role=python   Python peer")
+		fmt.Println("  WSS  /ws/signal?role=browser  Browser peer")
+		fmt.Println("  GET  /health                  Health check")
+		fmt.Println("  GET  /status                  Status JSON")
+		fmt.Println()
 
-	log.Fatal(http.ListenAndServe(":"+port, corsMiddleware(mux)))
+		// HTTP → HTTPS redirect goroutine
+		go func() {
+			redirect := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				host := r.Host
+				if h, _, err := net.SplitHostPort(host); err == nil {
+					host = h
+				}
+				target := "https://" + host
+				if port != "443" {
+					target += ":" + port
+				}
+				target += r.URL.RequestURI()
+				http.Redirect(w, r, target, http.StatusMovedPermanently)
+			})
+			fmt.Printf("  HTTP redirect  :%s → HTTPS :%s\n\n", httpPort, port)
+			if err := http.ListenAndServe(":"+httpPort, redirect); err != nil {
+				log.Printf("HTTP redirect listener error: %v", err)
+			}
+		}()
+
+		log.Fatal(http.ListenAndServeTLS(":"+port, certFile, keyFile, handler))
+
+	} else {
+		// ── HTTP / WS mode (no TLS) ───────────────────────────────────────────
+		fmt.Printf("  Mode      : HTTP / WS  (no TLS — development only)\n")
+		fmt.Printf("  HTTP      : http://localhost:%s\n", port)
+		fmt.Printf("  WS        : ws://localhost:%s/ws/signal\n", port)
+		fmt.Printf("  Web root  : %s\n", *fWebRoot)
+		fmt.Println()
+		fmt.Println("  WS   /ws/signal?role=python   Python peer")
+		fmt.Println("  WS   /ws/signal?role=browser  Browser peer")
+		fmt.Println("  GET  /health                  Health check")
+		fmt.Println("  GET  /status                  Status JSON")
+		fmt.Println()
+		fmt.Println("  Tip: add --tls-cert and --tls-key to enable HTTPS/WSS")
+		fmt.Println()
+
+		log.Fatal(http.ListenAndServe(":"+port, handler))
+	}
+}
+
+// envOr returns the value of the environment variable key, or fallback if unset.
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
