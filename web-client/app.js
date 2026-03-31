@@ -51,6 +51,17 @@ function startSending() {
 function sendTwist() {
     if (!state.dc || state.dc.readyState !== 'open') return;
 
+    // E-Stop: suppress all twist messages — only idle keep-alive pings
+    if (state.eStop) {
+        const perfNow = performance.now();
+        if (perfNow - state.lastIdlePingMs >= CONFIG.idlePingIntervalMs) {
+            sendSyncReq();
+            state.lastIdlePingMs = perfNow;
+        }
+        if (state.twistActive) { state.twistActive = false; setChartActive(false); }
+        return;
+    }
+
     const effLinY = state.gpActive ? state.gpLinY : state.linY;
     const effAngZ = state.gpActive ? state.gpAngZ : state.angZ;
     const moving  = effLinY !== 0 || effAngZ !== 0;
@@ -91,17 +102,38 @@ function sendTwist() {
 
 // ── Stop helper ───────────────────────────────────────────────────────────────
 
-function sendStop() {
-    state.linY = 0; state.angZ = 0;
-    state.gpLinY = 0; state.gpAngZ = 0; state.gpActive = false;
+/**
+ * Engage e-stop: zero all axes, send one zero twist, block further sending.
+ * Press Space again (or any movement key) to disengage.
+ */
+function engageEStop() {
+    state.eStop   = true;
+    state.linY    = 0; state.angZ  = 0;
+    state.gpLinY  = 0; state.gpAngZ = 0; state.gpActive = false;
     updateControlDisplay();
     drawWheel();
+    updateEStopUI();
+    // Send one explicit zero twist so the robot halts immediately
     if (state.dc && state.dc.readyState === 'open') {
         state.msgId++;
         const buf = encodeTwist(state.msgId, now(), { lx:0, ly:0, lz:0, ax:0, ay:0, az:0 });
         try { state.dc.send(buf); } catch (_) {}
     }
-    logInfo('ctrl', 'STOP sent');
+    logInfo('ctrl', 'E-STOP engaged — all twist output suppressed');
+}
+
+function disengageEStop() {
+    state.eStop = false;
+    updateEStopUI();
+    logInfo('ctrl', 'E-STOP disengaged — twist output resumed');
+}
+
+function updateEStopUI() {
+    const btn = document.getElementById('stopBtn');
+    if (btn) {
+        btn.textContent = state.eStop ? '⛔ E-STOP (Space to resume)' : 'Stop';
+        btn.classList.toggle('estop-active', state.eStop);
+    }
 }
 
 // ── Incoming message handlers ─────────────────────────────────────────────────
@@ -228,9 +260,10 @@ function setupHzSelector() {
 
 function init() {
     // Register message handlers before any connection attempt
-    handlers.onAck       = handleAck;
-    handlers.onSyncResp  = handleSyncResp;
-    handlers.onConnected = startSending;
+    handlers.onAck        = handleAck;
+    handlers.onSyncResp   = handleSyncResp;
+    handlers.onConnected  = startSending;
+    handlers.toggleEStop  = () => state.eStop ? disengageEStop() : engageEStop();
 
     initChart();
     setupKeyboard();
@@ -243,7 +276,7 @@ function init() {
     // Button wiring
     const $ = (id) => document.getElementById(id);
     $('connectBtn')    ?.addEventListener('click', () => state.connected ? disconnect() : connect());
-    $('stopBtn')       ?.addEventListener('click', sendStop);
+    $('stopBtn')       ?.addEventListener('click', () => state.eStop ? disengageEStop() : engageEStop());
     $('syncBtn')       ?.addEventListener('click', sendSyncReq);
     $('resetZoomBtn')  ?.addEventListener('click', resetZoom);
     $('downloadLogBtn')?.addEventListener('click', downloadLog);

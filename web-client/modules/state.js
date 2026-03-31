@@ -29,6 +29,7 @@ export const state = {
     sendTimer:      null,
     twistActive:    false,
     lastIdlePingMs: 0,
+    eStop:          false,  // when true, all twist output is zeroed and suppressed
 
     // ── Keyboard / joystick velocities ────────────────────────────────────────
     linY:         0,      // forward / backward [-currentSpeed, +currentSpeed]
@@ -74,7 +75,8 @@ export const state = {
  * dispatch incoming messages without importing app.js (which would be circular).
  */
 export const handlers = {
-    onAck:       null,   // (ArrayBuffer) → void
-    onSyncResp:  null,   // (ArrayBuffer) → void
-    onConnected: null,   // () → void  (called when DataChannel opens)
+    onAck:        null,   // (ArrayBuffer) → void
+    onSyncResp:   null,   // (ArrayBuffer) → void
+    onConnected:  null,   // () → void  (called when DataChannel opens)
+    toggleEStop:  null,   // () → void  (space / stop button)
 };

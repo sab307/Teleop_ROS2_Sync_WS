@@ -261,6 +261,8 @@
         }
         .btn-primary   { background: linear-gradient(135deg, var(--cyan), var(--blue)); color: var(--bg); }
         .btn-secondary { background: var(--bg); color: var(--text); border: 1px solid var(--border); }
+        .btn.estop-active { background: #f72585; color: #fff; border-color: #f72585; animation: estop-pulse 0.8s ease-in-out infinite alternate; }
+        @keyframes estop-pulse { from { opacity: 1; } to { opacity: 0.7; } }
         .btn-small {
             padding: 5px 12px; border: none; border-radius: 5px;
             font-family: inherit; font-size: 11px; font-weight: 600; cursor: pointer;
@@ -538,7 +540,7 @@
                             <div class="value-box"><div class="value-label">Turn</div>   <div class="value-num" id="angZ">0.00</div></div>
                         </div>
                         <button class="btn btn-primary"   id="connectBtn">Connect</button>
-                        <button class="btn btn-secondary" id="stopBtn">Stop (Space)</button>
+                        <button class="btn btn-secondary" id="stopBtn">Stop</button>
                     </div>
                 </div>
 
@@ -587,6 +589,7 @@
                                 <select id="gpFwdAxisSel" class="gp-select">
                                     <option value="2" selected>Axis 2</option>
                                     <option value="5">Axis 5</option>
+                                    
                                 </select>
                             </div>
                             <div>
@@ -594,6 +597,7 @@
                                 <select id="gpRevAxisSel" class="gp-select">
                                     <option value="2">Axis 2</option>
                                     <option value="5" selected>Axis 5</option>
+                                    
                                 </select>
                             </div>
                         </div>

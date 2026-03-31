@@ -6,8 +6,12 @@
  * Gamepad / steering-wheel is handled separately in steering.js.
  */
 
-import { state }                from './state.js';
+import { state, handlers }      from './state.js';
 import { updateControlDisplay } from './ui.js';
+
+/** Movement key set (everything except space) */
+const MOVE_KEYS = new Set(['w','s','a','d','arrowup','arrowdown','arrowleft','arrowright']);
+const ALL_KEYS  = new Set([...MOVE_KEYS, ' ']);
 
 // ── Keyboard ──────────────────────────────────────────────────────────────────
 
@@ -16,11 +20,17 @@ export function setupKeyboard() {
         // Ignore if focus is on a text input or select
         if (['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName)) return;
         const key = e.key.toLowerCase();
-        if (['w','s','a','d','arrowup','arrowdown','arrowleft','arrowright',' '].includes(key)) {
-            e.preventDefault();
-            state.keysPressed.add(key);
-            updateFromKeys();
+        if (!ALL_KEYS.has(key)) return;
+        e.preventDefault();
+
+        // Space toggles e-stop
+        if (key === ' ') {
+            handlers.toggleEStop();
+            return;
         }
+
+        state.keysPressed.add(key);
+        updateFromKeys();
     });
     document.addEventListener('keyup', (e) => {
         state.keysPressed.delete(e.key.toLowerCase());
@@ -35,13 +45,14 @@ export function setupKeyboard() {
 export function updateFromKeys() {
     // Gamepad has higher priority — skip keyboard update while it's active
     if (state.gpActive) return;
+    // E-stop blocks all movement output
+    if (state.eStop) return;
 
     let newLinY = 0, newAngZ = 0;
     if (state.keysPressed.has('w') || state.keysPressed.has('arrowup'))    newLinY =  state.currentSpeed;
     if (state.keysPressed.has('s') || state.keysPressed.has('arrowdown'))  newLinY = -state.currentSpeed;
     if (state.keysPressed.has('a') || state.keysPressed.has('arrowleft'))  newAngZ =  state.currentSpeed;
     if (state.keysPressed.has('d') || state.keysPressed.has('arrowright')) newAngZ = -state.currentSpeed;
-    if (state.keysPressed.has(' ')) { newLinY = 0; newAngZ = 0; }
 
     state.linY = newLinY;
     state.angZ = newAngZ;
