@@ -4,10 +4,11 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Teleop Latency Dashboard</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link  rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.31/dist/uPlot.iife.min.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Space+Grotesk:wght@400;600&display=swap');
-        
+
         :root {
             --bg: #0a0a0f;
             --bg2: #12121a;
@@ -22,28 +23,28 @@
             --text2: #8a8a9a;
             --border: #2a2a3a;
         }
-        
+
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        
+
         body {
             font-family: 'Space Grotesk', sans-serif;
             background: var(--bg);
             color: var(--text);
             min-height: 100vh;
         }
-        
+
         .grid-bg {
             position: fixed;
             inset: 0;
-            background-image: 
+            background-image:
                 linear-gradient(rgba(0,245,212,0.02) 1px, transparent 1px),
                 linear-gradient(90deg, rgba(0,245,212,0.02) 1px, transparent 1px);
             background-size: 40px 40px;
             pointer-events: none;
         }
-        
+
         .container { position: relative; max-width: 1400px; margin: 0 auto; padding: 20px; }
-        
+
         header {
             display: flex;
             justify-content: space-between;
@@ -52,7 +53,7 @@
             padding-bottom: 16px;
             border-bottom: 1px solid var(--border);
         }
-        
+
         .logo { display: flex; align-items: center; gap: 12px; }
         .logo-icon {
             width: 36px; height: 36px;
@@ -66,7 +67,7 @@
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
         }
-        
+
         .status {
             display: flex; align-items: center; gap: 8px;
             padding: 6px 14px;
@@ -82,9 +83,9 @@
             background: #ff006e;
         }
         .status-dot.on { background: #00f5a0; }
-        
+
         .main { display: grid; grid-template-columns: 1fr 300px; gap: 16px; }
-        
+
         .panel {
             background: var(--bg2);
             border: 1px solid var(--border);
@@ -101,12 +102,44 @@
             color: var(--text2);
         }
         .panel-body { padding: 16px; }
-        
-        .chart-wrap { height: 260px; }
-        
+
+        .chart-wrap {
+            height: 260px;
+            position: relative;
+            overflow: visible;
+        }
+
+        .chart-state-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 2px 9px;
+            border-radius: 10px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 0.3px;
+            transition: background 0.3s, color 0.3s;
+        }
+        .chart-state-badge.idle {
+            background: rgba(255,255,255,0.12);
+            color: #aaa;
+            border: 1px solid #444;
+        }
+        .chart-state-badge.active {
+            background: rgba(0,245,212,0.15);
+            color: var(--cyan);
+            border: 1px solid var(--cyan);
+        }
+        .chart-state-dot {
+            width: 6px; height: 6px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+
         .metrics {
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
+            grid-template-columns: repeat(4, 1fr);
             gap: 8px;
             margin-top: 16px;
         }
@@ -118,22 +151,19 @@
             border-left: 3px solid var(--cyan);
         }
         .metric.m { border-left-color: var(--magenta); }
-        .metric.y { border-left-color: var(--yellow); }
         .metric.b { border-left-color: var(--blue); }
         .metric.o { border-left-color: var(--orange); }
-        .metric.p { border-left-color: var(--purple); }
-        
+
         .metric-label { font-size: 10px; color: var(--text2); margin-bottom: 4px; }
         .metric-val { font-family: 'JetBrains Mono', monospace; font-size: 18px; font-weight: 600; }
         .metric-unit { font-size: 11px; color: var(--text2); }
-        
-        /* Speed Control */
+
+        /* Speed / Hz controls */
         .speed-control {
             margin-bottom: 16px;
             padding-bottom: 16px;
             border-bottom: 1px solid var(--border);
         }
-        
         .speed-label {
             display: flex;
             justify-content: space-between;
@@ -141,296 +171,259 @@
             margin-bottom: 8px;
             font-size: 12px;
         }
-        
         .speed-value {
             font-family: 'JetBrains Mono', monospace;
             font-size: 18px;
             font-weight: 600;
             color: var(--cyan);
         }
-        
         .speed-slider {
-            width: 100%;
-            height: 8px;
-            -webkit-appearance: none;
-            appearance: none;
-            background: var(--bg);
-            border-radius: 4px;
-            outline: none;
+            width: 100%; height: 8px;
+            -webkit-appearance: none; appearance: none;
+            background: var(--bg); border-radius: 4px; outline: none;
         }
-        
         .speed-slider::-webkit-slider-thumb {
-            -webkit-appearance: none;
-            appearance: none;
-            width: 20px;
-            height: 20px;
+            -webkit-appearance: none; appearance: none;
+            width: 20px; height: 20px;
             background: linear-gradient(135deg, var(--cyan), var(--blue));
-            border-radius: 50%;
-            cursor: pointer;
-            box-shadow: 0 2px 8px rgba(0, 245, 212, 0.3);
+            border-radius: 50%; cursor: pointer;
+            box-shadow: 0 2px 8px rgba(0,245,212,0.3);
         }
-        
         .speed-slider::-moz-range-thumb {
-            width: 20px;
-            height: 20px;
+            width: 20px; height: 20px;
             background: linear-gradient(135deg, var(--cyan), var(--blue));
-            border-radius: 50%;
-            cursor: pointer;
-            border: none;
+            border-radius: 50%; cursor: pointer; border: none;
         }
-        
         .speed-range {
-            display: flex;
-            justify-content: space-between;
-            font-size: 10px;
-            color: var(--text2);
-            margin-top: 4px;
+            display: flex; justify-content: space-between;
+            font-size: 10px; color: var(--text2); margin-top: 4px;
         }
-        
+
+        /* Hz dropdown */
+        .hz-select {
+            width: 100%; padding: 7px 10px;
+            background: var(--bg); color: var(--text);
+            border: 1px solid var(--border); border-radius: 6px;
+            font-family: 'JetBrains Mono', monospace; font-size: 13px;
+            cursor: pointer; outline: none;
+            -webkit-appearance: none; appearance: none;
+        }
+        .hz-select:focus { border-color: var(--cyan); }
+
         /* Keyboard Controls */
-        .keyboard-control {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            gap: 8px;
-        }
-        
-        .key-row {
-            display: flex;
-            gap: 8px;
-        }
-        
+        .keyboard-control { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+        .key-row { display: flex; gap: 8px; }
         .key {
-            width: 44px;
-            height: 44px;
+            width: 44px; height: 44px;
             background: var(--bg);
             border: 2px solid var(--border);
             border-radius: 8px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
+            display: flex; align-items: center; justify-content: center;
             font-family: 'JetBrains Mono', monospace;
-            font-size: 14px;
-            font-weight: 600;
-            color: var(--text2);
+            font-size: 14px; font-weight: 600; color: var(--text2);
             transition: all 0.1s;
         }
-        
         .key.active {
-            background: var(--cyan);
-            border-color: var(--cyan);
-            color: var(--bg);
-            box-shadow: 0 0 15px rgba(0, 245, 212, 0.4);
+            background: var(--cyan); border-color: var(--cyan); color: var(--bg);
+            box-shadow: 0 0 15px rgba(0,245,212,0.4);
         }
-        
-        .key-hint {
-            font-size: 10px;
-            color: var(--text2);
-            text-align: center;
-            margin-top: 8px;
-        }
-        
-        /* Joystick (backup) */
+        .key-hint { font-size: 10px; color: var(--text2); text-align: center; margin-top: 8px; }
+
+        /* Joystick */
         .joystick-container {
             width: 120px; height: 120px;
             margin: 12px auto 0;
-            background: var(--bg);
-            border: 2px solid var(--border);
-            border-radius: 50%;
-            position: relative;
-            touch-action: none;
+            background: var(--bg); border: 2px solid var(--border);
+            border-radius: 50%; position: relative; touch-action: none;
         }
         .joystick-knob {
             width: 36px; height: 36px;
             background: linear-gradient(135deg, var(--cyan), var(--blue));
-            border-radius: 50%;
-            position: absolute;
-            top: 50%; left: 50%;
-            transform: translate(-50%, -50%);
-            cursor: grab;
+            border-radius: 50%; position: absolute;
+            top: 50%; left: 50%; transform: translate(-50%,-50%); cursor: grab;
         }
-        .crosshair {
-            position: absolute; inset: 0;
-            pointer-events: none;
-        }
+        .crosshair { position: absolute; inset: 0; pointer-events: none; }
         .crosshair::before, .crosshair::after {
             content: ''; position: absolute; background: var(--border);
         }
         .crosshair::before { width: 1px; height: 100%; left: 50%; }
-        .crosshair::after { height: 1px; width: 100%; top: 50%; }
-        
-        .values {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 8px;
-            margin-top: 12px;
-        }
-        .value-box {
-            background: var(--bg);
-            padding: 8px;
-            border-radius: 6px;
-            text-align: center;
-        }
+        .crosshair::after  { height: 1px; width: 100%; top: 50%; }
+
+        .values { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
+        .value-box { background: var(--bg); padding: 8px; border-radius: 6px; text-align: center; }
         .value-label { font-size: 10px; color: var(--text2); }
         .value-num { font-family: 'JetBrains Mono', monospace; font-size: 14px; color: var(--cyan); }
-        
+
         .btn {
-            width: 100%;
-            padding: 10px;
-            margin-top: 8px;
-            border: none;
-            border-radius: 6px;
-            font-family: inherit;
-            font-size: 12px;
-            font-weight: 600;
-            cursor: pointer;
+            width: 100%; padding: 10px; margin-top: 8px;
+            border: none; border-radius: 6px;
+            font-family: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
         }
-        .btn-primary {
-            background: linear-gradient(135deg, var(--cyan), var(--blue));
-            color: var(--bg);
+        .btn-primary   { background: linear-gradient(135deg, var(--cyan), var(--blue)); color: var(--bg); }
+        .btn-secondary { background: var(--bg); color: var(--text); border: 1px solid var(--border); }
+        .btn.estop-active { background: #f72585; color: #fff; border-color: #f72585; animation: estop-pulse 0.8s ease-in-out infinite alternate; }
+        @keyframes estop-pulse { from { opacity: 1; } to { opacity: 0.7; } }
+        .btn-small {
+            padding: 5px 12px; border: none; border-radius: 5px;
+            font-family: inherit; font-size: 11px; font-weight: 600; cursor: pointer;
+            background: var(--bg); color: var(--text2); border: 1px solid var(--border);
         }
-        .btn-secondary {
-            background: var(--bg);
-            color: var(--text);
-            border: 1px solid var(--border);
-        }
-        
+        .btn-small:hover { border-color: var(--cyan); color: var(--cyan); }
+
         .breakdown { margin-top: 12px; }
         .breakdown-item {
-            display: flex;
-            justify-content: space-between;
-            padding: 8px 0;
-            border-bottom: 1px solid var(--border);
-            font-size: 11px;
+            display: flex; justify-content: space-between;
+            padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 11px;
         }
         .breakdown-item:last-child { border: none; }
         .breakdown-label { display: flex; align-items: center; gap: 6px; }
         .breakdown-dot { width: 8px; height: 8px; border-radius: 2px; }
         .breakdown-val { font-family: 'JetBrains Mono', monospace; font-weight: 600; }
-        
-        /* Timestamps */
+
         .timestamps {
-            background: var(--bg);
-            padding: 10px;
-            border-radius: 6px;
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 10px;
+            background: var(--bg); padding: 10px; border-radius: 6px;
+            font-family: 'JetBrains Mono', monospace; font-size: 10px;
         }
-        .ts-row {
-            display: flex;
-            justify-content: space-between;
-            padding: 4px 0;
-            border-bottom: 1px solid var(--border);
-        }
+        .ts-row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid var(--border); }
         .ts-row:last-child { border: none; }
         .ts-label { color: var(--text2); }
         .ts-val { color: var(--cyan); }
-        
+
         .sync-info {
-            background: var(--bg);
-            padding: 10px;
-            border-radius: 6px;
-            margin-top: 10px;
-            font-size: 10px;
+            background: var(--bg); padding: 10px; border-radius: 6px;
+            margin-top: 10px; font-size: 10px;
         }
         .sync-row { display: flex; justify-content: space-between; margin-bottom: 4px; }
         .sync-row:last-child { margin: 0; }
         .sync-label { color: var(--text2); }
         .sync-val { font-family: 'JetBrains Mono', monospace; color: var(--cyan); }
-        
         .sync-note {
-            margin-top: 10px;
-            padding: 8px;
-            background: rgba(0, 245, 212, 0.1);
-            border-radius: 4px;
-            font-size: 9px;
-            color: var(--cyan);
-            text-align: center;
+            margin-top: 10px; padding: 8px;
+            background: rgba(0,245,212,0.1); border-radius: 4px;
+            font-size: 9px; color: var(--cyan); text-align: center;
         }
-        
+
         .proto-info {
-            margin-top: 12px;
-            padding: 10px;
-            background: var(--bg);
-            border-radius: 6px;
+            margin-top: 12px; padding: 10px;
+            background: var(--bg); border-radius: 6px;
             font-family: 'JetBrains Mono', monospace;
-            font-size: 9px;
-            color: var(--text2);
+            font-size: 9px; color: var(--text2);
         }
         .proto-info code { color: var(--cyan); }
-        
-        /* Field Selector */
+
         .field-info {
-            background: var(--bg);
-            padding: 10px;
-            border-radius: 6px;
-            margin-bottom: 10px;
+            background: var(--bg); padding: 10px; border-radius: 6px; margin-bottom: 10px;
         }
-        .field-info-row {
-            display: flex;
-            justify-content: space-between;
-            margin-bottom: 4px;
-            font-size: 11px;
-        }
+        .field-info-row { display: flex; justify-content: space-between; margin-bottom: 4px; font-size: 11px; }
         .field-info-row:last-child { margin: 0; }
         .field-info-label { color: var(--text2); }
-        .field-info-val {
-            font-family: 'JetBrains Mono', monospace;
-            font-weight: 600;
-            color: var(--cyan);
-        }
-        
-        .field-selector {
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
-            margin-bottom: 10px;
-        }
-        
+        .field-info-val { font-family: 'JetBrains Mono', monospace; font-weight: 600; color: var(--cyan); }
+
+        .field-selector { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
         .field-toggle {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            padding: 6px 10px;
-            background: var(--bg);
-            border-radius: 6px;
-            cursor: pointer;
-            font-size: 11px;
-            transition: all 0.15s;
+            display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+            background: var(--bg); border-radius: 6px; cursor: pointer;
+            font-size: 11px; transition: all 0.15s;
         }
         .field-toggle:hover { background: var(--bg3); }
-        
         .field-toggle input[type="checkbox"] {
-            appearance: none;
-            -webkit-appearance: none;
-            width: 16px;
-            height: 16px;
-            border: 2px solid var(--border);
-            border-radius: 3px;
-            cursor: pointer;
-            position: relative;
-            flex-shrink: 0;
+            appearance: none; -webkit-appearance: none;
+            width: 16px; height: 16px;
+            border: 2px solid var(--border); border-radius: 3px;
+            cursor: pointer; position: relative; flex-shrink: 0;
         }
-        .field-toggle input[type="checkbox"]:checked {
-            background: var(--cyan);
-            border-color: var(--cyan);
-        }
+        .field-toggle input[type="checkbox"]:checked { background: var(--cyan); border-color: var(--cyan); }
         .field-toggle input[type="checkbox"]:checked::after {
-            content: '✓';
-            position: absolute;
-            top: -2px;
-            left: 1px;
-            font-size: 12px;
-            color: var(--bg);
-            font-weight: bold;
+            content: '✓'; position: absolute; top: -2px; left: 1px;
+            font-size: 12px; color: var(--bg); font-weight: bold;
         }
-        
         .field-name { flex: 1; color: var(--text); }
-        .field-bit {
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 9px;
-            color: var(--text2);
+        .field-bit { font-family: 'JetBrains Mono', monospace; font-size: 9px; color: var(--text2); }
+
+        /* ── Steering wheel panel ────────────────────────────────────────── */
+        .wheel-viz {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin-bottom: 12px;
         }
+        .wheel-viz canvas {
+            display: block;
+            border-radius: 50%;
+            background: var(--bg3);
+            border: 1px solid var(--border);
+        }
+        .wheel-hint {
+            font-size: 9px; color: var(--text2); margin-top: 5px; text-align: center;
+        }
+
+        .gp-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            margin-bottom: 10px;
+        }
+        .gp-label {
+            font-size: 10px; color: var(--text2); margin-bottom: 4px;
+        }
+        .gp-select {
+            width: 100%; padding: 5px 8px;
+            background: var(--bg); color: var(--text);
+            border: 1px solid var(--border); border-radius: 5px;
+            font-family: 'JetBrains Mono', monospace; font-size: 11px;
+            cursor: pointer; outline: none;
+        }
+        .gp-select:focus { border-color: var(--cyan); }
+
+        .gp-slider-row {
+            display: flex; align-items: center; justify-content: space-between;
+            gap: 8px; margin-bottom: 8px;
+        }
+        .gp-slider-label { font-size: 10px; color: var(--text2); white-space: nowrap; }
+        .gp-slider-val {
+            font-family: 'JetBrains Mono', monospace; font-size: 11px;
+            color: var(--cyan); min-width: 32px; text-align: right;
+        }
+        .gp-slider {
+            flex: 1; height: 6px;
+            -webkit-appearance: none; appearance: none;
+            background: var(--bg3); border-radius: 3px; outline: none;
+        }
+        .gp-slider::-webkit-slider-thumb {
+            -webkit-appearance: none; width: 14px; height: 14px;
+            background: var(--cyan); border-radius: 50%; cursor: pointer;
+        }
+        .gp-slider::-moz-range-thumb {
+            width: 14px; height: 14px;
+            background: var(--cyan); border-radius: 50%; border: none; cursor: pointer;
+        }
+
+        .gp-invert-row {
+            display: flex; justify-content: space-between;
+            align-items: center; gap: 8px; margin-bottom: 6px;
+            font-size: 10px; color: var(--text2);
+        }
+        .gp-invert-row input[type="checkbox"] {
+            appearance: none; -webkit-appearance: none;
+            width: 14px; height: 14px;
+            border: 2px solid var(--border); border-radius: 3px;
+            cursor: pointer; position: relative; flex-shrink: 0;
+        }
+        .gp-invert-row input[type="checkbox"]:checked { background: var(--magenta); border-color: var(--magenta); }
+        .gp-invert-row input[type="checkbox"]:checked::after {
+            content: '✓'; position: absolute; top: -2px; left: 1px;
+            font-size: 10px; color: #fff; font-weight: bold;
+        }
+
+        .gp-live {
+            background: var(--bg); padding: 8px 10px; border-radius: 6px;
+            font-family: 'JetBrains Mono', monospace; font-size: 10px;
+            margin-top: 8px;
+        }
+        .gp-live-row { display: flex; justify-content: space-between; margin-bottom: 3px; }
+        .gp-live-row:last-child { margin: 0; }
+        .gp-live-label { color: var(--text2); }
+        .gp-live-val { color: var(--cyan); }
 
         @media (max-width: 900px) {
             .main { grid-template-columns: 1fr; }
@@ -451,31 +444,38 @@
                 <span id="statusText">Disconnected</span>
             </div>
         </header>
-        
+
         <div class="main">
+            <!-- ── Left column ─────────────────────────────────────────── -->
             <div class="left">
                 <div class="panel">
-                    <div class="panel-header">RTT Latency (20s)</div>
+                    <div class="panel-header" style="display:flex;justify-content:space-between;align-items:center;">
+                        <span style="display:flex;align-items:center;gap:10px;">
+                            RTT Latency (20s) — scroll to zoom · drag to pan
+                            <span id="chartStateBadge" class="chart-state-badge idle">
+                                <span class="chart-state-dot"></span>IDLE
+                            </span>
+                        </span>
+                        <button id="resetZoomBtn" class="btn-small">Reset Zoom</button>
+                    </div>
                     <div class="panel-body">
-                        <div class="chart-wrap"><canvas id="chart"></canvas></div>
+                        <div id="chart" class="chart-wrap"></div>
                         <div class="metrics">
-                            <div class="metric"><div class="metric-label">Total RTT</div><div class="metric-val" id="mRtt">--<span class="metric-unit">ms</span></div></div>
-                            <div class="metric m"><div class="metric-label">Browser→Relay</div><div class="metric-val" id="mBR">--<span class="metric-unit">ms</span></div></div>
-                            <div class="metric y"><div class="metric-label">Relay→Python</div><div class="metric-val" id="mRP">--<span class="metric-unit">ms</span></div></div>
-                            <div class="metric b"><div class="metric-label">Python Proc</div><div class="metric-val" id="mPy">--<span class="metric-unit">ms</span></div></div>
-                            <div class="metric o"><div class="metric-label">Python→Relay</div><div class="metric-val" id="mPR">--<span class="metric-unit">ms</span></div></div>
-                            <div class="metric p"><div class="metric-label">Relay→Browser</div><div class="metric-val" id="mRB">--<span class="metric-unit">ms</span></div></div>
+                            <div class="metric">  <div class="metric-label">Total RTT</div>        <div class="metric-val" id="mRtt">--<span class="metric-unit">ms</span></div></div>
+                            <div class="metric m"><div class="metric-label">Browser→Python</div>   <div class="metric-val" id="mBR">--<span class="metric-unit">ms</span></div></div>
+                            <div class="metric b"><div class="metric-label">Python Proc</div>      <div class="metric-val" id="mPy">--<span class="metric-unit">ms</span></div></div>
+                            <div class="metric o"><div class="metric-label">Python→Browser</div>   <div class="metric-val" id="mPR">--<span class="metric-unit">ms</span></div></div>
                         </div>
                     </div>
                 </div>
-                
+
                 <div class="panel" style="margin-top:16px">
                     <div class="panel-header">Latency Breakdown (μs precision)</div>
                     <div class="panel-body">
                         <div class="breakdown" id="breakdown"></div>
                     </div>
                 </div>
-                
+
                 <div class="panel" style="margin-top:16px">
                     <div class="panel-header">Timestamps</div>
                     <div class="panel-body">
@@ -485,98 +485,231 @@
                     </div>
                 </div>
             </div>
-            
+
+            <!-- ── Right column ───────────────────────────────────────── -->
             <div class="right">
+
+                <!-- Keyboard / joystick / speed / Hz -->
                 <div class="panel">
                     <div class="panel-header">Keyboard Control</div>
                     <div class="panel-body">
-                        <!-- Speed Control -->
+
+                        <!-- Speed scale slider -->
                         <div class="speed-control">
                             <div class="speed-label">
-                                <span>Speed</span>
-                                <span class="speed-value" id="speedValue">1.0</span>
+                                <span>Speed Scale</span>
+                                <span class="speed-value" id="speedValue">0.50</span>
                             </div>
-                            <input type="range" id="speedSlider" class="speed-slider" min="1" max="8" step="0.5" value="1">
-                            <div class="speed-range">
-                                <span>1.0</span>
-                                <span>8.0</span>
-                            </div>
+                            <input type="range" id="speedSlider" class="speed-slider"
+                                   min="0.05" max="1.0" step="0.05" value="0.5">
+                            <div class="speed-range"><span>0.05</span><span>1.0</span></div>
                         </div>
-                        
-                        <div class="keyboard-control">
-                            <div class="key-row">
-                                <div class="key" id="key-w">W</div>
+
+                        <!-- Send rate selector -->
+                        <div class="speed-control">
+                            <div class="speed-label">
+                                <span>Send Rate</span>
+                                <span class="speed-value" id="hzValue">20 Hz</span>
                             </div>
+                            <select id="hzSelector" class="hz-select">
+                                <option value="5">5 Hz</option>
+                                <option value="10">10 Hz</option>
+                                <option value="20" selected>20 Hz</option>
+                                <option value="30">30 Hz</option>
+                                <option value="50">50 Hz</option>
+                            </select>
+                        </div>
+
+                        <div class="keyboard-control">
+                            <div class="key-row"><div class="key" id="key-w">W</div></div>
                             <div class="key-row">
                                 <div class="key" id="key-a">A</div>
                                 <div class="key" id="key-s">S</div>
                                 <div class="key" id="key-d">D</div>
                             </div>
-                            <div class="key-hint">
-                                WASD or Arrow Keys to move<br>
-                                Space to stop
-                            </div>
+                            <div class="key-hint">WASD or Arrow Keys · Space = stop</div>
                         </div>
-                        
+
                         <div class="joystick-container" id="joystick">
                             <div class="crosshair"></div>
                             <div class="joystick-knob" id="knob"></div>
                         </div>
-                        
+
                         <div class="values">
-                            <div class="value-box"><div class="value-label">Linear Y</div><div class="value-num" id="linY">0.00</div></div>
-                            <div class="value-box"><div class="value-label">Angular Z</div><div class="value-num" id="angZ">0.00</div></div>
+                            <div class="value-box"><div class="value-label">Forward</div><div class="value-num" id="linY">0.00</div></div>
+                            <div class="value-box"><div class="value-label">Turn</div>   <div class="value-num" id="angZ">0.00</div></div>
                         </div>
-                        <button class="btn btn-primary" id="connectBtn">Connect</button>
-                        <button class="btn btn-secondary" id="stopBtn">Stop (Space)</button>
+                        <button class="btn btn-primary"   id="connectBtn">Connect</button>
+                        <button class="btn btn-secondary" id="stopBtn">Stop</button>
                     </div>
                 </div>
-                
+
+                <!-- Steering wheel + Gamepad -->
                 <div class="panel" style="margin-top:16px">
-                    <div class="panel-header">Clock Sync (Browser ↔ Relay)</div>
+                    <div class="panel-header" style="display:flex;justify-content:space-between;align-items:center;">
+                        <span>Steering Wheel / Gamepad</span>
+                        <button id="wheelCentreBtn" class="btn-small">Centre</button>
+                    </div>
+                    <div class="panel-body">
+
+                        <!-- Visual steering wheel canvas -->
+                        <div class="wheel-viz">
+                            <canvas id="wheelCanvas" width="140" height="155"></canvas>
+                            <div class="wheel-hint">Drag to steer · gamepad auto-detected</div>
+                        </div>
+
+                        <!-- Gamepad status -->
+                        <div class="gp-live">
+                            <div class="gp-live-row">
+                                <span class="gp-live-label">Gamepad</span>
+                                <span class="gp-live-val" id="gpStatus">Not connected</span>
+                            </div>
+                            <div class="gp-live-row">
+                                <span class="gp-live-label">Steer · Axis 0 (angular.z)</span>
+                                <span class="gp-live-val" id="gpSteerVal">0.000</span>
+                            </div>
+                            <div class="gp-live-row">
+                                <span class="gp-live-label">Fwd trigger (linear +)</span>
+                                <span class="gp-live-val" id="gpFwdVal">0.000</span>
+                            </div>
+                            <div class="gp-live-row">
+                                <span class="gp-live-label">Rev trigger (linear −)</span>
+                                <span class="gp-live-val" id="gpRevVal">0.000</span>
+                            </div>
+                        </div>
+
+                        <!-- Axis selectors -->
+                        <div class="gp-grid" style="margin-top:10px;">
+                            <div>
+                                <div class="gp-label">Steer Axis (fixed)</div>
+                                <div class="gp-select" style="display:flex;align-items:center;padding:0 8px;opacity:0.6;cursor:default;">Axis 0</div>
+                            </div>
+                            <div>
+                                <div class="gp-label">Fwd Axis (linear +)</div>
+                                <select id="gpFwdAxisSel" class="gp-select">
+                                    <option value="2" selected>Axis 2</option>
+                                    <option value="5">Axis 5</option>
+                                    
+                                </select>
+                            </div>
+                            <div>
+                                <div class="gp-label">Rev Axis (linear −)</div>
+                                <select id="gpRevAxisSel" class="gp-select">
+                                    <option value="2">Axis 2</option>
+                                    <option value="5" selected>Axis 5</option>
+                                    
+                                </select>
+                            </div>
+                        </div>
+
+                        <!-- Invert toggle (steer only) -->
+                        <div class="gp-invert-row">
+                            <span>Invert Steer</span>
+                            <input type="checkbox" id="gpInvertSteer">
+                        </div>
+
+                        <!-- Deadzone -->
+                        <div class="gp-slider-row" style="margin-top:8px;">
+                            <span class="gp-slider-label">Deadzone</span>
+                            <input type="range" id="gpDzSlider" class="gp-slider"
+                                   min="0" max="0.3" step="0.01" value="0.05">
+                            <span class="gp-slider-val" id="gpDzVal">0.05</span>
+                        </div>
+
+                        <!-- Sensitivity -->
+                        <div class="gp-slider-row">
+                            <span class="gp-slider-label">Sensitivity</span>
+                            <input type="range" id="gpSensSlider" class="gp-slider"
+                                   min="0.1" max="2.0" step="0.05" value="1.0">
+                            <span class="gp-slider-val" id="gpSensVal">1.0</span>
+                        </div>
+
+                        <!-- Steer range -->
+                        <div class="gp-slider-row">
+                            <span class="gp-slider-label">Steer Range</span>
+                            <input type="range" id="wheelRangeSlider" class="gp-slider"
+                                   min="0.1" max="3.0" step="0.1" value="1.0">
+                            <span class="gp-slider-val" id="wheelRangeVal">±1.0</span>
+                        </div>
+
+                    </div>
+                </div>
+
+                <!-- Clock sync -->
+                <div class="panel" style="margin-top:16px">
+                    <div class="panel-header">Clock Sync (Browser ↔ Python)</div>
                     <div class="panel-body">
                         <div class="sync-info">
                             <div class="sync-row"><span class="sync-label">Offset</span><span class="sync-val" id="syncOffset">--</span></div>
-                            <div class="sync-row"><span class="sync-label">RTT</span><span class="sync-val" id="syncRtt">--</span></div>
+                            <div class="sync-row"><span class="sync-label">RTT</span>   <span class="sync-val" id="syncRtt">--</span></div>
                             <div class="sync-row"><span class="sync-label">Status</span><span class="sync-val" id="syncStatus">--</span></div>
                         </div>
                         <button class="btn btn-secondary" id="syncBtn">Force Sync</button>
-                        <div class="sync-note">All timestamps in Relay Time</div>
+                        <div class="sync-note">Offset: Python clock − Browser clock</div>
                     </div>
                 </div>
-                
+
+                <!-- Field selector -->
                 <div class="panel" style="margin-top:16px">
                     <div class="panel-header">Field Selector</div>
                     <div class="panel-body">
                         <div class="field-info">
-                            <div class="field-info-row">
-                                <span class="field-info-label">Mask</span>
-                                <span class="field-info-val" id="fieldMask">0x22</span>
-                            </div>
-                            <div class="field-info-row">
-                                <span class="field-info-label">Fields</span>
-                                <span class="field-info-val" id="fieldCount">2/6</span>
-                            </div>
-                            <div class="field-info-row">
-                                <span class="field-info-label">Msg Size</span>
-                                <span class="field-info-val" id="msgSize">34B</span>
-                            </div>
+                            <div class="field-info-row"><span class="field-info-label">Mask</span>    <span class="field-info-val" id="fieldMask">0x22</span></div>
+                            <div class="field-info-row"><span class="field-info-label">Fields</span>  <span class="field-info-val" id="fieldCount">2/6</span></div>
+                            <div class="field-info-row"><span class="field-info-label">Msg Size</span><span class="field-info-val" id="msgSize">34B</span></div>
                         </div>
                         <div class="field-selector" id="fieldSelector"></div>
-                        
+
+                        <button id="precisionBtn" class="btn" style="margin-top:10px;width:100%;font-family:'JetBrains Mono',monospace;font-size:12px;">Precision: f64 (8 B/field)</button>
+
                         <div class="proto-info">
-                            <div>Binary Protocol:</div>
-                            <div><code>0x01</code> Twist (18 + 8×N B)</div>
-                            <div><code>0x02</code> Ack (69B → 77B)</div>
-                            <div><code>0x03</code> SyncReq (9B)</div>
-                            <div><code>0x04</code> SyncResp (25B)</div>
+                            <div>Binary Protocol (CRC-8/SMBUS on all msgs):</div>
+                            <div><code>0x01</code> Twist (18 + N×{4|8} + 1 B)</div>
+                            <div><code>0x02</code> P2P Ack (38B)</div>
+                            <div><code>0x03</code> SyncReq / Idle Ping (10B)</div>
+                            <div><code>0x04</code> SyncResp / Idle Pong (26B)</div>
+                            <div style="margin-top:8px;border-top:1px solid var(--border);padding-top:8px;display:flex;justify-content:space-between;">
+                                <span>CRC Errors</span>
+                                <span id="crcErrors" style="font-family:'JetBrains Mono',monospace;color:var(--cyan);">0</span>
+                            </div>
                         </div>
                     </div>
                 </div>
-            </div>
+
+                <!-- Timestamp log -->
+                <div class="panel" style="margin-top:16px">
+                    <div class="panel-header" style="display:flex;justify-content:space-between;align-items:center;">
+                        <span>Timestamp Log</span>
+                        <div style="display:flex;gap:6px;">
+                            <button id="clearLogBtn" class="btn-small">Clear</button>
+                            <button id="downloadLogBtn" style="
+                                padding:3px 10px;font-size:10px;font-family:inherit;
+                                background:linear-gradient(135deg,var(--cyan),var(--blue));
+                                color:var(--bg);border:none;border-radius:4px;cursor:pointer;font-weight:600;">
+                                ↓ CSV
+                            </button>
+                        </div>
+                    </div>
+                    <div class="panel-body">
+                        <div style="background:var(--bg);padding:10px;border-radius:6px;font-size:10px;">
+                            <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                                <span style="color:var(--text2);">Buffered rows</span>
+                                <span id="logRowCount" style="font-family:'JetBrains Mono',monospace;color:var(--cyan);">0</span>
+                            </div>
+                            <div style="color:var(--text2);line-height:1.6;">
+                                TWIST rows on every ack (~20/s while moving).<br>
+                                SYNC rows on every clock-sync sample.<br>
+                                Max buffer: 100 000 rows.
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+            </div><!-- end .right -->
         </div>
     </div>
 
-    <script src="app.js"></script>
+    <!-- ES module entry point — no inline scripts needed -->
+    <script type="module" src="app.js"></script>
 </body>
 </html>
