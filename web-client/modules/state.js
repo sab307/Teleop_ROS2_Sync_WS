@@ -38,20 +38,38 @@ export const state = {
     keysPressed:  new Set(),
     keyTimer:     null,
 
+    // ── Input source selection ────────────────────────────────────────────────
+    /** Which input device drives sendTwist().
+     *  Values: 'keyboard' | 'gamepad' | 'steering'
+     *  - keyboard : WASD + on-screen joystick  → state.linY / state.angZ
+     *  - gamepad  : Logitech F310/F710 sticks  → state.gpLinY / state.gpAngZ
+     *  - steering : wheel + pedal triggers     → state.gpLinY / state.gpAngZ */
+    inputMode: 'keyboard',
+
     // ── Gamepad / steering-wheel ───────────────────────────────────────────────
     gpIndex:       null,  // index in navigator.getGamepads(), null = none
+    gpDeadzone:    0.05,  // axis values below this are treated as 0
+    gpSensitivity: 1.0,   // multiplier applied after deadzone removal
+
+    // Steering-wheel (mode='steering') — wheel + pedal triggers
     gpSteerAxis:   0,     // fixed: axis 0 → angular.z
     gpFwdAxis:     2,     // trigger axis for forward  (positive values only) → +linear
     gpRevAxis:     5,     // trigger axis for reverse  (positive values only) → -linear
-    gpDeadzone:    0.05,  // axis values below this are treated as 0
-    gpSensitivity: 1.0,   // multiplier applied after deadzone removal
-    gpInvertSteer: false, // flip sign of steer axis
+    gpInvertSteer: true,  // default ON: wheel right → -angular.z (ROS: clockwise/right turn)
     wheelRange:    1.0,   // max output for full-lock drag (±wheelRange)
+
+    // Logitech dual-stick (mode='gamepad')
+    gpLinAxis:       1,    // left-stick Y by default → linear_x
+    gpAngAxis:       2,    // right-stick X by default → angular_z
+    gpInvertLinAxis: true, // Gamepad API Y is negative-up; invert to ROS forward-positive
+    gpInvertAngAxis: true, // ROS REP-103: +z = CCW (left); stick-right gives +x, so invert
+    gpEStopButton:   1,    // 'B' on F310/F710 standard mapping (configurable)
+    gpEStopPrev:     false,// rising-edge latch so holding the button doesn't re-toggle
 
     // Computed values written by the gamepad poll loop
     gpLinY:   0,
     gpAngZ:   0,
-    gpActive: false,      // true while gamepad has non-zero output
+    gpActive: false,      // true while current-mode gamepad input is non-zero
 
     // ── Binary protocol ───────────────────────────────────────────────────────
     /** Bitmask of which Twist fields to include in each message (0x01–0x3F) */

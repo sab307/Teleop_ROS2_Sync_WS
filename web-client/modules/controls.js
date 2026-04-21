@@ -43,8 +43,8 @@ export function setupKeyboard() {
 }
 
 export function updateFromKeys() {
-    // Gamepad has higher priority — skip keyboard update while it's active
-    if (state.gpActive) return;
+    // Only keyboard mode routes WASD → state.linY/angZ
+    if (state.inputMode !== 'keyboard') return;
     // E-stop blocks all movement output
     if (state.eStop) return;
 
@@ -69,7 +69,7 @@ export function setupJoystick() {
     let dragging = false;
 
     const update = (x, y) => {
-        if (state.gpActive) return;
+        if (state.inputMode !== 'keyboard') return;
         const rect = container.getBoundingClientRect();
         const cx   = rect.width  / 2;
         const cy   = rect.height / 2;
@@ -98,7 +98,7 @@ export function setupJoystick() {
         dragging = false;
         knob.style.left = '50%';
         knob.style.top  = '50%';
-        if (!state.gpActive) { state.linY = 0; state.angZ = 0; updateControlDisplay(); }
+        if (state.inputMode === 'keyboard') { state.linY = 0; state.angZ = 0; updateControlDisplay(); }
     };
 
     knob.addEventListener('mousedown',  () => dragging = true);

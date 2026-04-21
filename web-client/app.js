@@ -28,7 +28,9 @@ import { initChart, updateChart, resetZoom,
 import { updateControlDisplay, updateCrcDisplay,
          updateMetrics, updateBreakdown, updateTimestamps,
          setupSpeedControl, setupFieldSelector,
-         setupPrecisionToggle } from './modules/ui.js';
+         setupPrecisionToggle,
+         setupInputModeSelector,
+         setupRoutingSelectors } from './modules/ui.js';
 import { setupKeyboard, setupJoystick } from './modules/controls.js';
 import { setupSteering, drawWheel }   from './modules/steering.js';
 import { connect, disconnect,
@@ -76,8 +78,12 @@ function sendTwist() {
         return;
     }
 
-    const effLinY = state.gpActive ? state.gpLinY : state.linY;
-    const effAngZ = state.gpActive ? state.gpAngZ : state.angZ;
+    // Source-of-truth per input mode. The keyboard mode uses state.linY/angZ
+    // written by controls.js; gamepad and steering modes use state.gpLinY/gpAngZ
+    // written by the poll loop in steering.js.
+    const useGp   = state.inputMode !== 'keyboard';
+    const effLinY = useGp ? state.gpLinY : state.linY;
+    const effAngZ = useGp ? state.gpAngZ : state.angZ;
     const moving  = effLinY !== 0 || effAngZ !== 0;
 
     if (moving) {
@@ -303,8 +309,10 @@ function init() {
     setupSpeedControl();
     setupHzSelector();
     setupFieldSelector();
+    setupRoutingSelectors();
     setupPrecisionToggle();
     setupSteering();
+    setupInputModeSelector();
 
     // Button wiring
     const $ = (id) => document.getElementById(id);

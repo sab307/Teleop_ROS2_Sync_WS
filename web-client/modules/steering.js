@@ -12,11 +12,15 @@
  *
  * Gamepad API
  * ────────────
- *   • Detects any connected gamepad (including racing-wheel peripherals).
- *   • Polls via requestAnimationFrame at ~60 fps while connected.
- *   • User-configurable: steering axis, forward axis, deadzone, sensitivity,
- *     per-axis invert toggles.
- *   • When gpActive is true, overrides keyboard / joystick in app.js.
+ *   • Two operating modes selected by state.inputMode:
+ *       - 'steering' : axis 0 bidirectional steer + axes 2/5 as pedal triggers
+ *       - 'gamepad'  : dual-stick (Logitech F310/F710) with configurable axes
+ *                      and an E-stop button (rising-edge → handlers.toggleEStop).
+ *   • Polls only while a mode needs it (maybeStartGpPoll / stopGpPoll).
+ *   • User-configurable: axis mapping, deadzone, sensitivity, per-axis invert,
+ *     and E-stop button index.
+ *   • When state.inputMode !== 'keyboard', writes to state.gpLinY / state.gpAngZ
+ *     are the source-of-truth for sendTwist() in app.js.
  *
  * Velocity mapping
  * ─────────────────
@@ -25,7 +29,7 @@
  *   These are read by sendTwist() in app.js.
  */
 
-import { state }                from './state.js';
+import { state, handlers }      from './state.js';
 import { updateControlDisplay } from './ui.js';
 import { logInfo, logWarn }     from './logger.js';
 
@@ -56,11 +60,8 @@ function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
 // ── Gamepad polling ───────────────────────────────────────────────────────────
 
-function pollGamepad() {
-    if (state.gpIndex === null) return;
-    const gp = navigator.getGamepads()[state.gpIndex];
-    if (!gp) { gpRAF = requestAnimationFrame(pollGamepad); return; }
-
+/** Reads wheel + pedal trigger inputs (mode='steering'). */
+function readWheelInputs(gp) {
     // Steer: axis 0 fixed, full bidirectional range
     const rawSteer = gp.axes[0] ?? 0;
     const steer = clamp(
@@ -88,22 +89,72 @@ function pollGamepad() {
     if (steerEl) steerEl.textContent = steer.toFixed(3);
     if (fwdEl)   fwdEl.textContent   = fwd.toFixed(3);
     if (revEl)   revEl.textContent   = rev.toFixed(3);
+}
+
+/** Reads dual-stick inputs + E-stop button (mode='gamepad').
+ *  Defaults: left-stick Y → linear_x, right-stick X → angular_z, button B → E-stop. */
+function readGamepadInputs(gp) {
+    const rawLin = gp.axes[state.gpLinAxis] ?? 0;
+    const rawAng = gp.axes[state.gpAngAxis] ?? 0;
+
+    const linSign = state.gpInvertLinAxis ? -1 : 1;
+    const angSign = state.gpInvertAngAxis ? -1 : 1;
+
+    const lin = clamp(applyDeadzone(rawLin, state.gpDeadzone) * state.gpSensitivity * linSign, -1, 1);
+    const ang = clamp(applyDeadzone(rawAng, state.gpDeadzone) * state.gpSensitivity * angSign, -1, 1);
+
+    state.gpLinY   = lin;
+    state.gpAngZ   = ang;
+    state.gpActive = Math.abs(rawLin) > state.gpDeadzone
+                  || Math.abs(rawAng) > state.gpDeadzone;
+
+    // Live value display in the gamepad panel
+    const linEl = document.getElementById('gpLinVal');
+    const angEl = document.getElementById('gpAngVal');
+    if (linEl) linEl.textContent = lin.toFixed(3);
+    if (angEl) angEl.textContent = ang.toFixed(3);
+
+    // E-stop button rising-edge: fires once per press, ignores hold
+    const btn       = gp.buttons[state.gpEStopButton];
+    const pressed   = btn?.pressed ?? false;
+    const btnEl     = document.getElementById('gpEStopVal');
+    if (btnEl) btnEl.textContent = pressed ? 'PRESSED' : 'released';
+    if (pressed && !state.gpEStopPrev && handlers.toggleEStop) {
+        handlers.toggleEStop();
+    }
+    state.gpEStopPrev = pressed;
+}
+
+function pollGamepad() {
+    if (state.gpIndex === null) return;
+    const gp = navigator.getGamepads()[state.gpIndex];
+    if (!gp) { gpRAF = requestAnimationFrame(pollGamepad); return; }
+
+    if      (state.inputMode === 'steering') readWheelInputs(gp);
+    else if (state.inputMode === 'gamepad')  readGamepadInputs(gp);
 
     drawWheel();
     updateControlDisplay();
     gpRAF = requestAnimationFrame(pollGamepad);
 }
 
-function startGpPoll() {
+/** Start the poll loop if a gamepad is connected AND the current input mode
+ *  needs it. Exported so ui.js can call it on mode change. */
+export function maybeStartGpPoll() {
+    const needed = state.gpIndex !== null
+                && (state.inputMode === 'gamepad' || state.inputMode === 'steering');
+    if (!needed) return;
     if (gpRAF) cancelAnimationFrame(gpRAF);
     gpRAF = requestAnimationFrame(pollGamepad);
 }
 
-function stopGpPoll() {
+/** Stop the poll loop and zero out gamepad-derived state. */
+export function stopGpPoll() {
     if (gpRAF) { cancelAnimationFrame(gpRAF); gpRAF = null; }
-    state.gpActive = false;
-    state.gpAngZ   = 0;
-    state.gpLinY   = 0;
+    state.gpActive    = false;
+    state.gpAngZ      = 0;
+    state.gpLinY      = 0;
+    state.gpEStopPrev = false;
 }
 
 function updateGpStatusDisplay() {
@@ -157,7 +208,7 @@ export function drawWheel() {
     const BLUE   = '#4361ee';
     const PINK   = '#f72585';
 
-    const angZVal = state.gpActive ? state.gpAngZ : state.angZ;
+    const angZVal = state.inputMode === 'keyboard' ? state.angZ : state.gpAngZ;
     // Normalize by wheelRange so full-lock value → ±LOCK_RAD rotation
     const normalized = clamp(angZVal / Math.max(state.wheelRange, 0.01), -1, 1);
     const angle      = normalized * LOCK_RAD;
@@ -250,7 +301,7 @@ function setupWheelDrag() {
     wheelCanvas.addEventListener('mousedown', (e) => {
         dragging       = true;
         dragStartAngle = pointerAngle(e);
-        dragStartAngZ  = state.gpActive ? state.gpAngZ : state.angZ;
+        dragStartAngZ  = state.inputMode === 'keyboard' ? state.angZ : state.gpAngZ;
         wheelCanvas.style.cursor = 'grabbing';
         e.preventDefault();
     });
@@ -258,7 +309,7 @@ function setupWheelDrag() {
     wheelCanvas.addEventListener('touchstart', (e) => {
         dragging       = true;
         dragStartAngle = pointerAngle(e);
-        dragStartAngZ  = state.gpActive ? state.gpAngZ : state.angZ;
+        dragStartAngZ  = state.inputMode === 'keyboard' ? state.angZ : state.gpAngZ;
         e.preventDefault();
     }, { passive: false });
 
@@ -286,10 +337,17 @@ export function setupSteering() {
     // ── Gamepad API events ────────────────────────────────────────────────────
     window.addEventListener('gamepadconnected', (e) => {
         state.gpIndex = e.gamepad.index;
-        logInfo('gamepad', `Connected: ${e.gamepad.id} (${e.gamepad.axes.length} axes)`);
+        logInfo('gamepad',
+            `Connected: ${e.gamepad.id} (${e.gamepad.axes.length} axes, ` +
+            `${e.gamepad.buttons.length} buttons, mapping='${e.gamepad.mapping}')`);
+        if (e.gamepad.mapping !== 'standard') {
+            logWarn('gamepad',
+                `Non-standard gamepad mapping — axis/button indices may not match ` +
+                `expected layout. Check device settings (X-input vs D-input).`);
+        }
         updateGpStatusDisplay();
         refreshAxisDropdowns();
-        startGpPoll();
+        maybeStartGpPoll();
     });
 
     window.addEventListener('gamepaddisconnected', (e) => {
@@ -307,10 +365,10 @@ export function setupSteering() {
     for (const gp of navigator.getGamepads()) {
         if (gp) {
             state.gpIndex = gp.index;
-            logInfo('gamepad', `Pre-connected: ${gp.id}`);
+            logInfo('gamepad', `Pre-connected: ${gp.id} (mapping='${gp.mapping}')`);
             updateGpStatusDisplay();
             refreshAxisDropdowns();
-            startGpPoll();
+            maybeStartGpPoll();
             break;
         }
     }
@@ -385,6 +443,54 @@ export function setupSteering() {
             state.gpActive = false;
             drawWheel();
             updateControlDisplay();
+        });
+    }
+
+    // ── Dual-stick (Logitech) mode wiring ─────────────────────────────────────
+
+    // Linear axis selector (stick Y axes)
+    const linAxisSel = document.getElementById('gpLinAxisSel');
+    if (linAxisSel) {
+        linAxisSel.value = String(state.gpLinAxis);
+        linAxisSel.addEventListener('change', (e) => {
+            state.gpLinAxis = parseInt(e.target.value, 10);
+        });
+    }
+
+    // Angular axis selector (stick X axes)
+    const angAxisSel = document.getElementById('gpAngAxisSel');
+    if (angAxisSel) {
+        angAxisSel.value = String(state.gpAngAxis);
+        angAxisSel.addEventListener('change', (e) => {
+            state.gpAngAxis = parseInt(e.target.value, 10);
+        });
+    }
+
+    // Invert linear axis
+    const invLin = document.getElementById('gpInvertLinAxis');
+    if (invLin) {
+        invLin.checked = state.gpInvertLinAxis;
+        invLin.addEventListener('change', (e) => { state.gpInvertLinAxis = e.target.checked; });
+    }
+
+    // Invert angular axis
+    const invAng = document.getElementById('gpInvertAngAxis');
+    if (invAng) {
+        invAng.checked = state.gpInvertAngAxis;
+        invAng.addEventListener('change', (e) => { state.gpInvertAngAxis = e.target.checked; });
+    }
+
+    // E-stop button picker (index 0..15)
+    const estopSel = document.getElementById('gpEStopButtonSel');
+    if (estopSel) {
+        // Populate with standard Xbox-layout labels
+        const labels = ['A (0)','B (1)','X (2)','Y (3)','LB (4)','RB (5)','LT (6)','RT (7)',
+                        'Back (8)','Start (9)','L3 (10)','R3 (11)','Up (12)','Down (13)','Left (14)','Right (15)'];
+        estopSel.innerHTML = labels.map((l, i) =>
+            `<option value="${i}"${i === state.gpEStopButton ? ' selected' : ''}>${l}</option>`).join('');
+        estopSel.addEventListener('change', (e) => {
+            state.gpEStopButton = parseInt(e.target.value, 10);
+            state.gpEStopPrev   = false;  // reset latch so new button starts clean
         });
     }
 
